@@ -1,0 +1,113 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Proton and Charged Particle Stopping Power Ratio Compute Shader
+ *
+ * Implements the relativistic Bethe-Bloch equation with Sternheimer density
+ * effect correction to evaluate the mass stopping power (S / rho) and linear
+ * stopping power (S) relative to water for proton and ion beam therapy.
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Calibrated density volume:
+// - R: Mass density rho (g / cm^3)
+// - G: Relative electron density rho_e
+// - B: Effective Z
+// - A: Material ID
+layout(binding = 0, rgba32f) readonly uniform image3D u_density_volume;
+
+// Output stopping power ratio volume:
+// - R: Proton stopping power relative to water (SPR)
+// - G: Mean excitation energy I (eV)
+// - B: Linear stopping power in medium (MeV / mm)
+// - A: Continuous slowing-down range scaling factor
+layout(binding = 1, rgba32f) writeonly uniform image3D u_stopping_power_volume;
+
+layout(std140, binding = 2) uniform ParticleBeamParams {
+    float kinetic_energy_mev;   // Incident particle kinetic energy (e.g. 150.0 MeV)
+    float particle_rest_mev;    // Rest mass energy (938.272 MeV for proton)
+    int   particle_charge_z;    // Projectile charge (+1 for proton, +2 for alpha)
+    float reference_water_spr;  // Unscaled reference stopping power in water (MeV / mm)
+    ivec4 volume_dimensions;    // (Nx, Ny, Nz, pad)
+};
+
+const float SPEED_OF_LIGHT_SI    = 299792458.0;
+const float ELECTRON_MASS_MEV    = 0.51099895;
+const float WATER_I_EV           = 75.0;
+const float PI_VAL               = 3.14159265359;
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    vec4 density_data = imageLoad(u_density_volume, voxel_coord);
+    float mass_density = density_data.r;
+    float rho_e = density_data.g;
+    float z_eff = density_data.b;
+    float material_id = density_data.a;
+
+    // Determine tissue-specific mean excitation potential I (eV)
+    // based on ICRU 49 / 73 recommendations
+    float i_value_ev = WATER_I_EV;
+    if (material_id < 0.5) {
+        i_value_ev = 85.7;  // Air
+    } else if (material_id < 2.5) {
+        i_value_ev = 75.3;  // Lung
+    } else if (material_id < 3.5) {
+        i_value_ev = 63.2;  // Adipose
+    } else if (material_id < 4.5) {
+        i_value_ev = 75.0;  // Water
+    } else if (material_id < 5.5) {
+        i_value_ev = 75.0;  // Muscle
+    } else if (material_id < 6.5) {
+        i_value_ev = 76.2;  // Cartilage
+    } else if (material_id < 7.5) {
+        i_value_ev = 91.9;  // Spongy bone
+    } else if (material_id < 8.5) {
+        i_value_ev = 112.0; // Cortical bone
+    } else {
+        i_value_ev = 233.0; // Titanium metal implant
+    }
+
+    // Kinematics of projectile
+    float tau = kinetic_energy_mev / particle_rest_mev; // Kinetic energy in units of rest mass
+    float gamma = 1.0 + tau;
+    float beta2 = 1.0 - 1.0 / (gamma * gamma);
+    float beta = sqrt(max(1.0e-6, beta2));
+
+    // Maximum kinematically transferable energy to atomic electron in single collision (W_max)
+    float s = ELECTRON_MASS_MEV / particle_rest_mev;
+    float w_max = (2.0 * ELECTRON_MASS_MEV * beta2 * gamma * gamma) /
+                  (1.0 + 2.0 * gamma * s + s * s);
+
+    // Relativistic Bethe-Bloch bracketed term:
+    // L(beta) = 0.5 * ln(2 * m_e * c^2 * beta^2 * gamma^2 * W_max / I^2) - beta^2
+    float bracket_medium = 0.5 * log((2.0 * ELECTRON_MASS_MEV * beta2 * gamma * gamma * w_max * 1.0e12) /
+                                     (i_value_ev * i_value_ev)) - beta2;
+    float bracket_water  = 0.5 * log((2.0 * ELECTRON_MASS_MEV * beta2 * gamma * gamma * w_max * 1.0e12) /
+                                     (WATER_I_EV * WATER_I_EV)) - beta2;
+
+    bracket_medium = max(0.01, bracket_medium);
+    bracket_water  = max(0.01, bracket_water);
+
+    // Stopping Power Ratio relative to water (SPR):
+    // SPR = rho_e * [ L_medium(beta) / L_water(beta) ]
+    float stopping_power_ratio = rho_e * (bracket_medium / bracket_water);
+
+    // Linear stopping power S in MeV / mm
+    float linear_stopping_power = stopping_power_ratio * reference_water_spr;
+
+    // Range scaling: inverse of stopping power ratio
+    float range_scaling = (stopping_power_ratio > 1.0e-5) ? (1.0 / stopping_power_ratio) : 1000.0;
+
+    imageStore(u_stopping_power_volume, voxel_coord, vec4(
+        stopping_power_ratio,
+        i_value_ev,
+        linear_stopping_power,
+        range_scaling
+    ));
+}

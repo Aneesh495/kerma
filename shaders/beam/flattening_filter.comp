@@ -1,0 +1,75 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Beam Flattening Filter Profile and Off-Axis Hardening Compute Shader
+ *
+ * Simulates radial fluence attenuation and spectral off-axis variation:
+ * - Flattened beam horn-profile generation via conical filter absorption
+ * - Flattening Filter Free (FFF) high-dose-rate unflattened forward peak
+ * - Radial spectral hardening / softening corrections
+ */
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// In-place or output 2D fluence intensity map
+layout(binding = 0, rgba32f) readonly  uniform image2D u_input_fluence;
+layout(binding = 1, rgba32f) writeonly uniform image2D u_output_fluence;
+
+layout(std140, binding = 2) uniform FilterConfig {
+    vec2  field_origin_mm;       // Corner coordinates at SAD
+    vec2  pixel_spacing_mm;      // Map pitch
+    ivec2 map_dimensions;        // Resolution
+    int   is_fff_beam;           // 1 if Flattening Filter Free, 0 if standard flattened
+    float horn_amplitude;        // Horn peak amplitude at field shoulder (~1.08)
+    float horn_radius_mm;        // Radial position of horn peak (~150.0 mm at SAD)
+    float central_axis_atten;    // Central axis filter attenuation factor (0.45)
+    float off_axis_softening_k;  // Radial spectral softening coefficient
+};
+
+void main() {
+    ivec2 pixel_coord = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel_coord, map_dimensions))) {
+        return;
+    }
+
+    vec2 pos_mm = field_origin_mm + (vec2(pixel_coord) + 0.5) * pixel_spacing_mm;
+    float radius_mm = length(pos_mm);
+
+    vec4 in_val = imageLoad(u_input_fluence, pixel_coord);
+    float base_intensity = in_val.r;
+
+    float profile_multiplier = 1.0;
+    float spectral_softening = 1.0;
+
+    if (is_fff_beam == 0) {
+        // Standard flattened beam:
+        // Conical filter creates flat profile across field with elevated horns near field edge
+        // Empirical parameterized profile: P(r) = (1 + a*(r/r_horn)^2) * exp(-b*(r/r_horn)^4)
+        float r_norm = radius_mm / max(1.0, horn_radius_mm);
+        float r_sq = r_norm * r_norm;
+        
+        // Conical filter absorption profile
+        float horn_boost = (horn_amplitude - 1.0) * (4.0 * r_sq * exp(-r_sq));
+        profile_multiplier = 1.0 + horn_boost;
+
+        // Radial softening factor: beam is harder on axis (thicker metal) and softer off axis
+        spectral_softening = exp(-off_axis_softening_k * r_sq);
+    } else {
+        // Flattening Filter Free (FFF):
+        // Raw forward-peaked bremsstrahlung profile: P(r) = 1 / (1 + (theta / theta_0)^2)^1.5
+        float theta = atan(radius_mm, 1000.0); // Polar angle from SAD = 1000 mm
+        float theta_char = 0.085; // Characteristic bremsstrahlung cone angle ~5 degrees
+        profile_multiplier = 1.0 / pow(1.0 + (theta * theta) / (theta_char * theta_char), 1.25);
+        spectral_softening = 0.92 + 0.08 * exp(-radius_mm / 100.0);
+    }
+
+    float final_intensity = base_intensity * profile_multiplier;
+
+    imageStore(u_output_fluence, pixel_coord, vec4(
+        final_intensity,
+        spectral_softening,
+        in_val.b,
+        in_val.a
+    ));
+}

@@ -1,0 +1,69 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Finite Focal Spot Geometric Penumbra Convolution Compute Shader
+ *
+ * Convolves ideal collimated fluence maps with the linear accelerator's
+ * finite electron focal spot source distribution (2D Gaussian FWHM ~1.5 mm):
+ * - Evaluates geometric penumbra broadening across collimating edges
+ * - Preserves total radiant energy integral
+ */
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Input sharp collimator transmission map (from jaw and MLC stages)
+layout(binding = 0, rgba32f) readonly uniform image2D u_input_sharp_fluence;
+
+// Output blurred fluence map accounting for finite focal spot size
+layout(binding = 1, rgba32f) writeonly uniform image2D u_output_convolved_fluence;
+
+layout(std140, binding = 2) uniform FocalSpotConfig {
+    vec2  focal_spot_fwhm_mm;   // Source Gaussian FWHM in X and Y (e.g. 1.5, 1.5 mm)
+    vec2  pixel_spacing_mm;     // Fluence map pitch (mm)
+    ivec2 map_dimensions;       // Resolution
+    float source_to_collimator_dist_mm; // Z-distance to collimator (~450 mm)
+    float sad_mm;               // Source-to-Axis Distance (1000 mm)
+};
+
+const float INV_TWO_PI = 0.15915494309;
+
+void main() {
+    ivec2 center_coord = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(center_coord, map_dimensions))) {
+        return;
+    }
+
+    // Projected focal spot standard deviation at isocenter plane:
+    // sigma_iso = sigma_source * (SAD - S_collimator) / S_collimator
+    float geom_ratio = (sad_mm - source_to_collimator_dist_mm) / source_to_collimator_dist_mm;
+    vec2 sigma_source = focal_spot_fwhm_mm / 2.354820045; // FWHM to sigma
+    vec2 sigma_projected_mm = sigma_source * geom_ratio;
+
+    // Convert sigma to pixel units
+    vec2 sigma_pixels = max(vec2(0.5), sigma_projected_mm / pixel_spacing_mm);
+    int kernel_radius = int(ceil(3.0 * max(sigma_pixels.x, sigma_pixels.y)));
+    kernel_radius = clamp(kernel_radius, 1, 12); // Limit filter window size
+
+    vec4 convolved_acc = vec4(0.0);
+    float weight_sum = 0.0;
+
+    for (int dy = -kernel_radius; dy <= kernel_radius; ++dy) {
+        for (int dx = -kernel_radius; dx <= kernel_radius; ++dx) {
+            ivec2 sample_coord = clamp(center_coord + ivec2(dx, dy), ivec2(0), map_dimensions - ivec2(1));
+            
+            vec2 offset_pixels = vec2(float(dx), float(dy));
+            float exponent = 0.5 * (
+                (offset_pixels.x * offset_pixels.x) / (sigma_pixels.x * sigma_pixels.x) +
+                (offset_pixels.y * offset_pixels.y) / (sigma_pixels.y * sigma_pixels.y)
+            );
+            float weight = exp(-exponent);
+
+            convolved_acc += imageLoad(u_input_sharp_fluence, sample_coord) * weight;
+            weight_sum += weight;
+        }
+    }
+
+    vec4 final_fluence = convolved_acc / max(1.0e-5, weight_sum);
+    imageStore(u_output_convolved_fluence, center_coord, final_fluence);
+}

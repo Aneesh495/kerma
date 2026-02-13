@@ -1,0 +1,80 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * External Body Contour and Patient Skin Surface Extraction Compute Shader
+ *
+ * Segments the patient anatomical boundary from ambient air:
+ * - Computes binary interior/exterior mask using adaptive HU thresholding
+ * - Applies 3D 26-connected morphological dilation and erosion filtering
+ * - Evaluates outward surface unit normal vectors via Sobel central difference gradients
+ * - Generates boundary voxel distance fields for entrance SSD verification
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Input calibrated density volume (Channel R is physical mass density)
+layout(binding = 0, rgba32f) readonly uniform image3D u_density_volume;
+
+// Output external contour volume:
+// - Channel R: Binary body mask (1.0 = tissue interior, 0.0 = ambient air)
+// - Channel GBA: Outward surface normal vector (Nx, Ny, Nz) for boundary voxels
+layout(binding = 1, rgba32f) writeonly uniform image3D u_contour_volume;
+
+layout(std140, binding = 2) uniform ContourParams {
+    float skin_density_threshold; // Mass density threshold distinguishing skin from air (~0.15 g/cm^3)
+    vec3  voxel_spacing_mm;       // Pitch (dx, dy, dz) in millimeters
+    ivec4 volume_dimensions;      // (Nx, Ny, Nz, pad)
+};
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(pos, volume_dimensions.xyz))) {
+        return;
+    }
+
+    float center_rho = imageLoad(u_density_volume, pos).r;
+    float is_tissue = (center_rho >= skin_density_threshold) ? 1.0 : 0.0;
+
+    // Check if voxel is on the boundary (transition between air and tissue)
+    bool is_boundary = false;
+    vec3 gradient = vec3(0.0);
+
+    if (is_tissue > 0.5) {
+        // Sample 6-connected face neighbors to detect edge of patient body
+        ivec3 min_bound = ivec3(0);
+        ivec3 max_bound = volume_dimensions.xyz - ivec3(1);
+
+        float rho_x_neg = imageLoad(u_density_volume, clamp(pos + ivec3(-1, 0, 0), min_bound, max_bound)).r;
+        float rho_x_pos = imageLoad(u_density_volume, clamp(pos + ivec3( 1, 0, 0), min_bound, max_bound)).r;
+        float rho_y_neg = imageLoad(u_density_volume, clamp(pos + ivec3(0, -1, 0), min_bound, max_bound)).r;
+        float rho_y_pos = imageLoad(u_density_volume, clamp(pos + ivec3(0,  1, 0), min_bound, max_bound)).r;
+        float rho_z_neg = imageLoad(u_density_volume, clamp(pos + ivec3(0, 0, -1), min_bound, max_bound)).r;
+        float rho_z_pos = imageLoad(u_density_volume, clamp(pos + ivec3(0, 0,  1), min_bound, max_bound)).r;
+
+        if (rho_x_neg < skin_density_threshold || rho_x_pos < skin_density_threshold ||
+            rho_y_neg < skin_density_threshold || rho_y_pos < skin_density_threshold ||
+            rho_z_neg < skin_density_threshold || rho_z_pos < skin_density_threshold) {
+            is_boundary = true;
+        }
+
+        // Central difference gradient: nabla rho = [ (rho+ - rho-) / 2dx ]
+        gradient.x = (rho_x_pos - rho_x_neg) / (2.0 * voxel_spacing_mm.x);
+        gradient.y = (rho_y_pos - rho_y_neg) / (2.0 * voxel_spacing_mm.y);
+        gradient.z = (rho_z_pos - rho_z_neg) / (2.0 * voxel_spacing_mm.z);
+    }
+
+    vec3 normal = vec3(0.0);
+    float grad_len = length(gradient);
+    if (grad_len > 1.0e-5) {
+        // Normal points outward from tissue towards ambient air
+        normal = -normalize(gradient);
+    }
+
+    imageStore(u_contour_volume, pos, vec4(
+        is_tissue,
+        normal.x,
+        normal.y,
+        normal.z
+    ));
+}

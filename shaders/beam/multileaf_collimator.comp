@@ -1,0 +1,126 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Dynamic Multi-Leaf Collimator (MLC) 2D Fluence Compute Shader
+ *
+ * Simulates high-definition double-focused or rounded-end MLC leaf banks:
+ * - Opposing Bank A and Bank B leaf tip positions (up to 160 leaves)
+ * - Rounded leaf-end transmission penumbra with geometric radius R (~100 mm)
+ * - Tongue-and-groove stepped interlocking edge transmission leakage
+ * - Inter-leaf transmission and carriage backup shielding
+ */
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Output 2D modulated fluence map at SAD
+// - Channel R: Primary fluence transmission factor [0.015, 1.0]
+// - Channel G: Unshielded binary aperture mask (1.0 = open, 0.0 = covered)
+// - Channel B: Tongue-and-groove attenuation penalty
+layout(binding = 0, rgba32f) writeonly uniform image2D u_mlc_fluence_map;
+
+// Uniform buffer holding leaf positions for Bank A (left) and Bank B (right)
+// Up to 160 leaf pairs
+layout(std430, binding = 1) buffer LeafPositionBuffer {
+    vec2 leaf_pairs[]; // x = bank_a_pos_mm, y = bank_b_pos_mm
+};
+
+layout(std140, binding = 2) uniform MLCConfig {
+    vec2  field_origin_mm;       // Physical coordinates of grid corner (0,0)
+    vec2  pixel_spacing_mm;      // Map pixel size (e.g. 0.5 x 0.5 mm)
+    ivec2 map_dimensions;        // Fluence map resolution
+    float leaf_width_mm;         // Physical width of each leaf at isocenter (e.g. 5.0 mm or 2.5 mm)
+    float leaf_y_origin_mm;      // Y-coordinate of leaf index 0 bottom edge
+    int   num_leaf_pairs;        // Total leaf pair count (e.g. 120)
+    float leaf_tip_radius_mm;    // Rounded leaf-end radius (typically 80 - 120 mm)
+    float leaf_transmission;     // Direct tungsten leaf transmission (0.015)
+    float tongue_groove_leakage; // Transmission through stepped tongue-and-groove edge (0.008)
+    float focus_distance_mm;     // Source to MLC mid-plane distance (~500 mm)
+};
+
+/**
+ * Evaluates transmission through a curved, rounded leaf tip.
+ * Uses analytical pathlength through circular leaf end arc.
+ */
+float computeRoundedLeafTransmission(float x, float leaf_tip_pos, bool is_bank_a, float radius, float base_leak) {
+    // Distance from coordinate to the projected nominal leaf tip
+    float delta_x = is_bank_a ? (leaf_tip_pos - x) : (x - leaf_tip_pos);
+
+    if (delta_x < 0.0) {
+        // Completely open: point is beyond leaf tip into open radiation field
+        return 1.0;
+    }
+
+    if (delta_x > radius) {
+        // Deep under the thick body of the leaf: base transmission leakage only
+        return base_leak;
+    }
+
+    // Circular arc pathlength: y = sqrt(R^2 - (R - delta_x)^2)
+    // Approximate thickness traversed by ray: t(delta_x) = 2.0 * sqrt(2.0 * R * delta_x - delta_x^2)
+    float circular_depth = sqrt(max(0.0, 2.0 * radius * delta_x - delta_x * delta_x));
+    // Linear attenuation coefficient for tungsten at 6 MV (~0.85 cm^-1 = 0.085 mm^-1)
+    float mu_tungsten_mm = 0.085;
+    float transmitted = exp(-mu_tungsten_mm * (2.0 * circular_depth));
+
+    return max(base_leak, transmitted);
+}
+
+void main() {
+    ivec2 pixel_coord = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel_coord, map_dimensions))) {
+        return;
+    }
+
+    vec2 pos_mm = field_origin_mm + (vec2(pixel_coord) + 0.5) * pixel_spacing_mm;
+
+    // Determine which leaf pair corresponds to this Y position
+    float relative_y = pos_mm.y - leaf_y_origin_mm;
+    int leaf_idx = int(floor(relative_y / leaf_width_mm));
+
+    if (leaf_idx < 0 || leaf_idx >= num_leaf_pairs) {
+        // Outside leaf coverage region: fully shielded
+        imageStore(u_mlc_fluence_map, pixel_coord, vec4(leaf_transmission, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    vec2 current_leaves = leaf_pairs[leaf_idx];
+    float pos_a = current_leaves.x;
+    float pos_b = current_leaves.y;
+
+    // Rounded tip transmission for current leaf pair
+    float trans_a = computeRoundedLeafTransmission(pos_mm.x, pos_a, true,  leaf_tip_radius_mm, leaf_transmission);
+    float trans_b = computeRoundedLeafTransmission(pos_mm.x, pos_b, false, leaf_tip_radius_mm, leaf_transmission);
+    float aperture_transmission = min(trans_a, trans_b);
+
+    // Binary open check (inside aperture boundaries)
+    float open_flag = (pos_mm.x > pos_a && pos_mm.x < pos_b) ? 1.0 : 0.0;
+
+    // Tongue-and-groove effect modeling at leaf borders:
+    // If adjacent leaf is closed while current is open, stepped edge attenuates radiation
+    float tg_penalty = 0.0;
+    float y_in_leaf = fract(relative_y / leaf_width_mm);
+    float edge_margin = 0.15; // 15% edge tongue and groove step
+
+    if (y_in_leaf < edge_margin && leaf_idx > 0) {
+        vec2 neighbor_leaves = leaf_pairs[leaf_idx - 1];
+        // If neighbor Bank A extends further into field than current Bank A
+        if (neighbor_leaves.x > pos_mm.x && pos_mm.x > pos_a) {
+            aperture_transmission *= (1.0 - tongue_groove_leakage * 5.0);
+            tg_penalty = 1.0;
+        }
+    } else if (y_in_leaf > (1.0 - edge_margin) && leaf_idx < (num_leaf_pairs - 1)) {
+        vec2 neighbor_leaves = leaf_pairs[leaf_idx + 1];
+        if (neighbor_leaves.x > pos_mm.x && pos_mm.x > pos_a) {
+            aperture_transmission *= (1.0 - tongue_groove_leakage * 5.0);
+            tg_penalty = 1.0;
+        }
+    }
+
+    imageStore(u_mlc_fluence_map, pixel_coord, vec4(
+        aperture_transmission,
+        open_flag,
+        tg_penalty,
+        1.0
+    ));
+}

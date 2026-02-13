@@ -1,0 +1,114 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Hounsfield Unit (HU) Stoichiometric Calibration Compute Shader
+ *
+ * Maps clinical CT scanner Hounsfield numbers [-1024, +3071] to:
+ * - Physical mass density rho (g / cm^3)
+ * - Electron density relative to water rho_e
+ * - Effective atomic number Z_eff
+ * - Discrete ICRU tissue material index
+ *
+ * Implements the piecewise bilinear stoichiometric calibration curve
+ * established by Schneider, Bortfeld, and Schlegel (Phys. Med. Biol. 2000).
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Input raw Hounsfield Unit CT volume
+layout(binding = 0, r32f) readonly uniform image3D u_input_ct_hu;
+
+// Output calibrated multi-channel tissue density volume:
+// - Channel R: Mass density rho (g / cm^3)
+// - Channel G: Relative electron density rho_e (dimensionless)
+// - Channel B: Effective atomic number Z_eff
+// - Channel A: Discrete material ID (float encoded)
+layout(binding = 1, rgba32f) writeonly uniform image3D u_output_density_volume;
+
+// Calibration parameters uniform buffer
+layout(std140, binding = 2) uniform CalibrationParams {
+    vec4 hu_breakpoints_1; // Air (-1000), Lung (-700), Adipose (-120), Water (0)
+    vec4 hu_breakpoints_2; // Muscle (+40), Trabecular (+300), Dense Bone (+1500), Titanium (+3000)
+    vec4 rho_values_1;     // Corresponding mass densities for breakpoints 1
+    vec4 rho_values_2;     // Corresponding mass densities for breakpoints 2
+    vec4 rhoe_values_1;    // Corresponding relative electron densities for breakpoints 1
+    vec4 rhoe_values_2;    // Corresponding relative electron densities for breakpoints 2
+    ivec4 volume_dimensions; // (dim_x, dim_y, dim_z, padding)
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    // Fetch raw Hounsfield value from input CT slice
+    float hu = imageLoad(u_input_ct_hu, voxel_coord).r;
+
+    float rho = 0.0;
+    float rho_e = 0.0;
+    float z_eff = 7.42;
+    float material_id = 4.0; // Default to water
+
+    if (hu <= hu_breakpoints_1.x) {
+        // Deep air / vacuum below -1000 HU
+        rho = rho_values_1.x;
+        rho_e = rhoe_values_1.x;
+        z_eff = 7.78;
+        material_id = 0.0; // Air
+    } else if (hu <= hu_breakpoints_1.y) {
+        // Air to lung interpolation [-1000, -700]
+        float t = (hu - hu_breakpoints_1.x) / (hu_breakpoints_1.y - hu_breakpoints_1.x);
+        rho = mix(rho_values_1.x, rho_values_1.y, t);
+        rho_e = mix(rhoe_values_1.x, rhoe_values_1.y, t);
+        z_eff = mix(7.78, 7.55, t);
+        material_id = 1.0; // Lung
+    } else if (hu <= hu_breakpoints_1.z) {
+        // Lung to adipose interpolation [-700, -120]
+        float t = (hu - hu_breakpoints_1.y) / (hu_breakpoints_1.z - hu_breakpoints_1.y);
+        rho = mix(rho_values_1.y, rho_values_1.z, t);
+        rho_e = mix(rhoe_values_1.y, rhoe_values_1.z, t);
+        z_eff = mix(7.55, 6.46, t);
+        material_id = 3.0; // Adipose
+    } else if (hu <= hu_breakpoints_1.w) {
+        // Adipose to water interpolation [-120, 0]
+        float t = (hu - hu_breakpoints_1.z) / (hu_breakpoints_1.w - hu_breakpoints_1.z);
+        rho = mix(rho_values_1.z, rho_values_1.w, t);
+        rho_e = mix(rhoe_values_1.z, rhoe_values_1.w, t);
+        z_eff = mix(6.46, 7.42, t);
+        material_id = 4.0; // Water
+    } else if (hu <= hu_breakpoints_2.x) {
+        // Water to muscle/soft tissue interpolation [0, +40]
+        float t = (hu - hu_breakpoints_1.w) / (hu_breakpoints_2.x - hu_breakpoints_1.w);
+        rho = mix(rho_values_1.w, rho_values_2.x, t);
+        rho_e = mix(rhoe_values_1.w, rhoe_values_2.x, t);
+        z_eff = mix(7.42, 7.64, t);
+        material_id = 5.0; // Muscle
+    } else if (hu <= hu_breakpoints_2.y) {
+        // Muscle to trabecular bone interpolation [+40, +300]
+        float t = (hu - hu_breakpoints_2.x) / (hu_breakpoints_2.y - hu_breakpoints_2.x);
+        rho = mix(rho_values_2.x, rho_values_2.y, t);
+        rho_e = mix(rhoe_values_2.x, rhoe_values_2.y, t);
+        z_eff = mix(7.64, 10.20, t);
+        material_id = 7.0; // Trabecular bone
+    } else if (hu <= hu_breakpoints_2.z) {
+        // Trabecular to dense cortical bone interpolation [+300, +1500]
+        float t = (hu - hu_breakpoints_2.y) / (hu_breakpoints_2.z - hu_breakpoints_2.y);
+        rho = mix(rho_values_2.y, rho_values_2.z, t);
+        rho_e = mix(rhoe_values_2.y, rhoe_values_2.z, t);
+        z_eff = mix(10.20, 13.80, t);
+        material_id = 8.0; // Cortical bone
+    } else {
+        // Cortical bone to metal artifact / titanium implant [+1500, +3000]
+        float t = clamp((hu - hu_breakpoints_2.z) / (hu_breakpoints_2.w - hu_breakpoints_2.z), 0.0, 1.0);
+        rho = mix(rho_values_2.z, rho_values_2.w, t);
+        rho_e = mix(rhoe_values_2.z, rhoe_values_2.w, t);
+        z_eff = mix(13.80, 22.00, t);
+        material_id = (t > 0.5) ? 9.0 : 8.0; // Titanium or dense bone
+    }
+
+    // Write 4-channel physical representation
+    vec4 calibrated_data = vec4(rho, rho_e, z_eff, material_id);
+    imageStore(u_output_density_volume, voxel_coord, calibrated_data);
+}

@@ -1,0 +1,66 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Dual-Energy Computed Tomography (DECT) Material Decomposition Compute Shader
+ *
+ * Implements Alvarez-Macovski two-parameter basis material decomposition
+ * from paired Low-kVp (e.g. 80 kVp) and High-kVp (e.g. 140 kVp) acquisitions:
+ * - Separates photoelectric cross section (Z^3.1 dependence) and Compton scatter
+ * - Synthesizes Virtual Monoenergetic Images (VMI) at arbitrary photon energies
+ * - Computes direct quantitative electron density maps and effective atomic numbers
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Low-energy acquisition (e.g. 80 kVp) attenuation volume (mm^-1)
+layout(binding = 0, r32f) readonly uniform image3D u_low_kvp_attenuation;
+
+// High-energy acquisition (e.g. 140 kVp) attenuation volume (mm^-1)
+layout(binding = 1, r32f) readonly uniform image3D u_high_kvp_attenuation;
+
+// Output decomposed parameters volume:
+// - Channel R: Photoelectric basis component (dimensionless)
+// - Channel G: Compton scatter basis component (relative to water)
+// - Channel B: Derived effective atomic number Z_eff
+// - Channel A: Synthesized virtual monoenergetic attenuation at target_kev (mm^-1)
+layout(binding = 2, rgba32f) writeonly uniform image3D u_dect_decomposition;
+
+layout(std140, binding = 3) uniform DECTParameters {
+    mat2  inv_basis_matrix;     // Inverted calibration matrix [[a11, a12], [a21, a22]]
+    float target_mono_kev;      // Target virtual monoenergetic energy (e.g. 70.0 keV)
+    float mono_photo_factor;    // Photoelectric energy scaling: (target_kev / ref_kev)^-3.1
+    float mono_compton_factor;  // Compton energy scaling: Klein-Nishina ratio
+    ivec4 volume_dimensions;    // (Nx, Ny, Nz, padding)
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    float mu_low  = imageLoad(u_low_kvp_attenuation, voxel_coord).r;
+    float mu_high = imageLoad(u_high_kvp_attenuation, voxel_coord).r;
+
+    // Solve for basis coefficients: [c_pe, c_comp]^T = inv_basis_matrix * [mu_low, mu_high]^T
+    vec2 basis_coeffs = inv_basis_matrix * vec2(mu_low, mu_high);
+    float c_photoelectric = max(0.0, basis_coeffs.x);
+    float c_compton       = max(0.001, basis_coeffs.y);
+
+    // Calculate effective atomic number Z_eff:
+    // Ratio of photoelectric to Compton cross section yields (Z_eff / Z_ref)^3.1
+    float ratio = c_photoelectric / c_compton;
+    float z_eff = 7.42 * pow(max(1.0e-4, ratio), 1.0 / 3.1);
+    z_eff = clamp(z_eff, 1.0, 30.0);
+
+    // Synthesize Virtual Monoenergetic Image (VMI) at specified target keV
+    float mu_vmi = c_photoelectric * mono_photo_factor + c_compton * mono_compton_factor;
+
+    imageStore(u_dect_decomposition, voxel_coord, vec4(
+        c_photoelectric,
+        c_compton,
+        z_eff,
+        mu_vmi
+    ));
+}

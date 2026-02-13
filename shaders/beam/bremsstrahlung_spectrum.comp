@@ -1,0 +1,108 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Medical Linear Accelerator Bremsstrahlung Spectrum Generator
+ *
+ * Evaluates the incident polyenergetic X-ray energy spectrum dPhi / dE
+ * produced by high-energy electrons striking a thick tungsten target:
+ * - Schiff differential cross-section for bremsstrahlung photon production
+ * - Target self-absorption and hardening through primary transmission filter
+ * - Computes normalized discrete energy bin weights and effective mean energy
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Output 1D spectrum buffer:
+// struct EnergyBin { float energy_mev; float fluence_weight; float mu_water; float mu_en_water; };
+layout(std430, binding = 0) buffer SpectrumOutputBuffer {
+    vec4 energy_bins[]; // x = energy_mev, y = fluence_weight, z = mu_water, w = mu_en_water
+};
+
+// Summary metrics output:
+// x = mean_energy_mev, y = total_fluence, z = effective_attenuation, w = total_bins
+layout(std430, binding = 1) buffer SpectrumSummaryBuffer {
+    vec4 summary_metrics;
+};
+
+layout(std140, binding = 2) uniform SpectrumConfig {
+    float nominal_peak_energy_mv; // Incident electron kinetic energy (e.g. 6.0, 10.0, 15.0 MV)
+    float target_thickness_mm;    // Tungsten target physical thickness (typically ~1.0 mm)
+    float filtration_copper_mm;   // Primary beam flattening filtration (mm Cu equivalent)
+    int   num_energy_bins;        // Discrete bin count (e.g. 64 or 128 bins)
+};
+
+const float PI_VAL = 3.14159265359;
+const float REST_MASS_MEV = 0.51099895;
+
+/**
+ * Evaluates Kramers-Schiff thick target bremsstrahlung emission intensity.
+ */
+float computeRawBremsstrahlung(float photon_energy_mev, float peak_energy_mev) {
+    if (photon_energy_mev >= peak_energy_mev || photon_energy_mev <= 0.05) {
+        return 0.0;
+    }
+    // Kramers empirical law with relativistic high-energy Schiff forward correction
+    float fraction = photon_energy_mev / peak_energy_mev;
+    float kramers_factor = (1.0 - fraction);
+    
+    // Schiff relativistic correction factor for thick targets
+    float gamma = 1.0 + peak_energy_mev / REST_MASS_MEV;
+    float schiff_shape = log(2.0 * gamma * (1.0 - fraction) / max(0.01, fraction)) - 0.5;
+    schiff_shape = max(0.1, schiff_shape);
+
+    return kramers_factor * schiff_shape;
+}
+
+/**
+ * Evaluates tungsten target and copper filter self-attenuation.
+ */
+float computeFiltrationTransmission(float photon_energy_mev, float w_thick_mm, float cu_thick_mm) {
+    // Narrow-beam total linear attenuation parameterization for tungsten (Z=74, rho=19.3 g/cm^3)
+    float mu_w = 19.3 * (0.045 + 0.15 / pow(photon_energy_mev, 1.8)); // cm^-1
+    // Narrow-beam total attenuation for copper (Z=29, rho=8.96 g/cm^3)
+    float mu_cu = 8.96 * (0.035 + 0.08 / pow(photon_energy_mev, 1.5)); // cm^-1
+
+    float optical_depth = (mu_w * (w_thick_mm * 0.1)) + (mu_cu * (cu_thick_mm * 0.1));
+    return exp(-optical_depth);
+}
+
+/**
+ * Reference water mass attenuation and mass energy absorption coefficients.
+ */
+vec2 getWaterCoefficients(float photon_energy_mev) {
+    // Parameterized Compton + Pair production coefficients in water (cm^-1)
+    float mu_compton = 0.0635 / (1.0 + 0.4 * photon_energy_mev);
+    float mu_pair    = (photon_energy_mev > 1.022) ? 0.002 * (photon_energy_mev - 1.022) : 0.0;
+    float mu_total   = mu_compton + mu_pair;
+
+    // Energy absorption fraction (energy transferred to charged particles)
+    float energy_transfer_fraction = clamp(0.45 + 0.05 * photon_energy_mev, 0.4, 0.95);
+    float mu_en = mu_total * energy_transfer_fraction;
+
+    return vec2(mu_total, mu_en);
+}
+
+void main() {
+    uint bin_idx = gl_GlobalInvocationID.x;
+    if (bin_idx >= uint(num_energy_bins)) {
+        return;
+    }
+
+    // Energy center of bin (spanning from 0.1 MeV to peak MV)
+    float delta_e = (nominal_peak_energy_mv - 0.1) / float(num_energy_bins);
+    float energy_mev = 0.1 + (float(bin_idx) + 0.5) * delta_e;
+
+    float raw_intensity = computeRawBremsstrahlung(energy_mev, nominal_peak_energy_mv);
+    float transmission  = computeFiltrationTransmission(energy_mev, target_thickness_mm, filtration_copper_mm);
+    float filtered_fluence = raw_intensity * transmission;
+
+    vec2 water_coeffs = getWaterCoefficients(energy_mev);
+
+    energy_bins[bin_idx] = vec4(
+        energy_mev,
+        filtered_fluence,
+        water_coeffs.x,
+        water_coeffs.y
+    );
+}

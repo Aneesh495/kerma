@@ -1,0 +1,79 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Secondary Collimator Jaw Transmission and Penumbra Compute Shader
+ *
+ * Models primary radiation attenuation through upper and lower tungsten jaws:
+ * - Asymmetric independent jaw positioning (X1, X2, Y1, Y2)
+ * - Error-function (erf) geometric source penumbra profile along field margins
+ * - Direct primary transmission leakage through thick tungsten alloy blocks (~0.5%)
+ */
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Output 2D fluence modulation texture at reference SAD isocenter plane (400 x 400 mm)
+// - Channel R: Primary jaw transmission factor [0.005, 1.0]
+// - Channel G: Jaw edge distance (signed distance in mm)
+layout(binding = 0, rg32f) writeonly uniform image2D u_jaw_transmission_map;
+
+layout(std140, binding = 1) uniform JawGeometryConfig {
+    vec4  jaw_positions_mm;     // (x1_left, x2_right, y1_bottom, y2_top) in mm at SAD
+    vec2  field_origin_mm;      // Physical coordinate of grid center (0,0)
+    vec2  pixel_spacing_mm;     // Physical pitch of fluence map (e.g. 1.0 mm)
+    ivec2 map_dimensions;       // Grid width and height (e.g. 512 x 512)
+    float penumbra_sigma_mm;    // Gaussian focal penumbra width (typically ~1.2 mm)
+    float jaw_transmission_leak;// Residual transmission through tungsten (0.005)
+};
+
+const float INV_SQRT_TWO = 0.7071067811865;
+
+/**
+ * Abramowitz and Stegun numerical approximation for error function erf(x).
+ * Maximum error is less than 1.5e-7.
+ */
+float erfApprox(float x) {
+    float sign_x = sign(x);
+    float abs_x = abs(x);
+    float t = 1.0 / (1.0 + 0.3275911 * abs_x);
+    float poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+    return sign_x * (1.0 - poly * exp(-abs_x * abs_x));
+}
+
+/**
+ * Calculates transmission profile across a single collimating edge.
+ */
+float edgeTransmission(float coord, float edge_pos, bool is_upper_bound, float sigma, float leak) {
+    float diff = is_upper_bound ? (edge_pos - coord) : (coord - edge_pos);
+    float z = (diff / sigma) * INV_SQRT_TWO;
+    float erf_val = erfApprox(clamp(z, -4.0, 4.0));
+    float open_fraction = 0.5 * (1.0 + erf_val);
+    return leak + (1.0 - leak) * open_fraction;
+}
+
+void main() {
+    ivec2 pixel_coord = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel_coord, map_dimensions))) {
+        return;
+    }
+
+    // Convert pixel coordinate to physical mm in IEC beam-limiting coordinate system
+    vec2 pos_mm = field_origin_mm + (vec2(pixel_coord) + 0.5) * pixel_spacing_mm;
+
+    // Evaluate transmission across all 4 independent jaws:
+    // X1 is left boundary (lower bound), X2 is right boundary (upper bound)
+    // Y1 is bottom boundary (lower bound), Y2 is top boundary (upper bound)
+    float trans_x1 = edgeTransmission(pos_mm.x, jaw_positions_mm.x, false, penumbra_sigma_mm, jaw_transmission_leak);
+    float trans_x2 = edgeTransmission(pos_mm.x, jaw_positions_mm.y, true,  penumbra_sigma_mm, jaw_transmission_leak);
+    float trans_y1 = edgeTransmission(pos_mm.y, jaw_positions_mm.z, false, penumbra_sigma_mm, jaw_transmission_leak);
+    float trans_y2 = edgeTransmission(pos_mm.y, jaw_positions_mm.w, true,  penumbra_sigma_mm, jaw_transmission_leak);
+
+    float combined_transmission = trans_x1 * trans_x2 * trans_y1 * trans_y2;
+
+    // Signed distance to closest jaw edge (positive inside aperture, negative under jaw)
+    float dist_x = min(pos_mm.x - jaw_positions_mm.x, jaw_positions_mm.y - pos_mm.x);
+    float dist_y = min(pos_mm.y - jaw_positions_mm.z, jaw_positions_mm.w - pos_mm.y);
+    float signed_dist_mm = min(dist_x, dist_y);
+
+    imageStore(u_jaw_transmission_map, pixel_coord, vec4(combined_transmission, signed_dist_mm, 0.0, 0.0));
+}
