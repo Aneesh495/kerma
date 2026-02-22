@@ -1,0 +1,93 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Radiological Pathlength 3D Raycasting Compute Shader
+ *
+ * Integrates radiological water-equivalent depth d_eff(x, y, z)
+ * from radiation source position along divergent ray lines through
+ * heterogeneous 3D patient CT electron density distribution:
+ *   d_eff(r) = integral_{r_skin}^{r} rho_e(s) ds
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Calibrated density volume: Channel G holds relative electron density rho_e
+layout(binding = 0, rgba32f) readonly uniform image3D u_density_volume;
+
+// External contour volume: Channel R holds binary body mask (1.0 = tissue)
+layout(binding = 1, rgba32f) readonly uniform image3D u_contour_volume;
+
+// Output 3D radiological depth volume:
+// - Channel R: Cumulative radiological depth d_eff in mm water-equivalent
+// - Channel G: Geometric distance from skin entry (mm)
+// - Channel B: Source-to-voxel Euclidean distance (mm)
+// - Channel A: Primary ray unit transmission factor exp(-mu * d_eff)
+layout(binding = 2, rgba32f) writeonly uniform image3D u_pathlength_volume;
+
+layout(std140, binding = 3) uniform PathlengthBeamConfig {
+    vec3  source_pos_world_mm;  // Physical position of linac source in patient frame
+    vec3  grid_origin_mm;       // Coordinate of voxel (0,0,0) in patient frame
+    vec3  voxel_spacing_mm;     // Grid pitch (dx, dy, dz) in mm
+    ivec4 volume_dimensions;    // (Nx, Ny, Nz, pad)
+    float effective_mu_water_mm;// Effective broad-beam attenuation in water (~0.0045 mm^-1)
+    float sad_mm;               // Source-to-Axis Distance (1000 mm)
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    // Physical position of target voxel center
+    vec3 voxel_pos_mm = grid_origin_mm + (vec3(voxel_coord) + 0.5) * voxel_spacing_mm;
+
+    // Primary ray vector from source to this voxel
+    vec3 ray_vec = voxel_pos_mm - source_pos_world_mm;
+    float dist_to_source = length(ray_vec);
+    vec3 ray_dir = ray_vec / max(1.0e-5, dist_to_source);
+
+    // Number of integration steps along the divergent ray from source to voxel
+    // Adaptive step size based on average voxel pitch
+    float step_size_mm = min(min(voxel_spacing_mm.x, voxel_spacing_mm.y), voxel_spacing_mm.z) * 0.75;
+    int num_steps = int(ceil(dist_to_source / step_size_mm));
+    num_steps = clamp(num_steps, 2, 512);
+    float actual_step_mm = dist_to_source / float(num_steps);
+
+    float cumulative_rho_e_mm = 0.0;
+    float geometric_depth_skin_mm = 0.0;
+    bool entered_patient = false;
+
+    vec3 grid_span_mm = vec3(volume_dimensions.xyz) * voxel_spacing_mm;
+
+    // Raymarch backwards from voxel towards source or forwards from source towards voxel
+    for (int step = 0; step < num_steps; ++step) {
+        float current_dist = float(step) * actual_step_mm;
+        vec3 sample_world_pos = source_pos_world_mm + ray_dir * current_dist;
+
+        // Check if sample point lies inside CT bounding box
+        vec3 local_pos = sample_world_pos - grid_origin_mm;
+        if (all(greaterThanEqual(local_pos, vec3(0.0))) && all(lessThan(local_pos, grid_span_mm))) {
+            ivec3 sample_voxel = ivec3(floor(local_pos / voxel_spacing_mm));
+            sample_voxel = clamp(sample_voxel, ivec3(0), volume_dimensions.xyz - ivec3(1));
+
+            float body_mask = imageLoad(u_contour_volume, sample_voxel).r;
+            if (body_mask > 0.5) {
+                entered_patient = true;
+                float rho_e = imageLoad(u_density_volume, sample_voxel).g;
+                cumulative_rho_e_mm += rho_e * actual_step_mm;
+                geometric_depth_skin_mm += actual_step_mm;
+            }
+        }
+    }
+
+    float primary_attenuation = exp(-effective_mu_water_mm * cumulative_rho_e_mm);
+
+    imageStore(u_pathlength_volume, voxel_coord, vec4(
+        cumulative_rho_e_mm,
+        geometric_depth_skin_mm,
+        dist_to_source,
+        primary_attenuation
+    ));
+}

@@ -1,0 +1,52 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Collapsed Cone Density Kernel Scaling Compute Shader
+ *
+ * Implements O'Connor theorem for point spread function scaling:
+ *   A_medium(r) = (rho_e)^2 * A_water(r * rho_e)
+ *
+ * Pre-computes 3D effective radiological stretch factors along
+ * directional vectors through the patient density volume.
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Calibrated density volume: Channel G = relative electron density rho_e
+layout(binding = 0, rgba32f) readonly uniform image3D u_density_volume;
+
+// Output density scaling metrics volume
+layout(binding = 1, rgba32f) writeonly uniform image3D u_scaling_volume;
+
+layout(std140, binding = 2) uniform ScalingConfig {
+    vec3  sample_direction;     // Active cone direction unit vector
+    vec3  voxel_spacing_mm;     // Grid pitch
+    ivec4 volume_dimensions;    // (Nx, Ny, Nz, pad)
+    float kernel_range_mm;      // Maximum kernel interaction radius (~150 mm)
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    vec4 density_data = imageLoad(u_density_volume, voxel_coord);
+    float local_rho_e = max(0.001, density_data.g);
+
+    // O'Connor density scaling factors
+    float density_sq = local_rho_e * local_rho_e;
+    float inv_rho_e  = 1.0 / local_rho_e;
+
+    // Radius scaling: in dense bone (rho_e ~ 1.8), range is compressed by 1 / 1.8
+    // In lung (rho_e ~ 0.25), range is extended by 1 / 0.25 = 4x
+    float range_stretched_mm = kernel_range_mm * inv_rho_e;
+
+    imageStore(u_scaling_volume, voxel_coord, vec4(
+        density_sq,
+        local_rho_e,
+        range_stretched_mm,
+        inv_rho_e
+    ));
+}

@@ -1,0 +1,118 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * 3D Polyenergetic TERMA (Total Energy Released per unit MAss) Volume Compute Shader
+ *
+ * Computes primary TERMA T_E(r) at each CT voxel:
+ *   T_E(r) = (mu / rho)(E, r) * Psi_0(u, v) * (SAD / r_source)^2 * exp(-int mu(s) ds)
+ *
+ * Inputs:
+ * - 2D collimated fluence map at SAD (Jaws + MLC + Flattening filter)
+ * - 3D CT density volume (rho and rho_e)
+ * - 3D radiological pathlength volume (d_eff)
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// 2D collimated incident fluence map at SAD plane (400 x 400 mm)
+layout(binding = 0) uniform sampler2D u_collimated_fluence_map;
+
+// 3D calibrated density volume (Channel R = mass density, Channel G = rho_e)
+layout(binding = 1, rgba32f) readonly uniform image3D u_density_volume;
+
+// 3D radiological depth volume (Channel R = d_eff, Channel B = dist_to_source)
+layout(binding = 2, rgba32f) readonly uniform image3D u_pathlength_volume;
+
+// 3D External patient contour mask
+layout(binding = 3, rgba32f) readonly uniform image3D u_contour_volume;
+
+// Output 3D TERMA volume:
+// - Channel R: Primary photon TERMA (MeV / g per MU)
+// - Channel G: Primary energy fluence Psi(r) (MeV / mm^2 per MU)
+// - Channel B: Projected collimator plane coordinates (u, v) in mm
+// - Channel A: Inverse-square geometric divergence factor
+layout(binding = 4, rgba32f) writeonly uniform image3D u_terma_volume;
+
+layout(std140, binding = 5) uniform TermaConfig {
+    vec3  source_pos_world_mm;  // Linac focal spot in patient frame
+    vec3  isocenter_world_mm;   // Target isocenter in patient frame
+    vec3  grid_origin_mm;       // Voxel (0,0,0) position
+    vec3  voxel_spacing_mm;     // Grid pitch
+    ivec4 volume_dimensions;    // (Nx, Ny, Nz, pad)
+    mat4  world_to_bev_matrix;  // Transform from patient frame to Beam Eye View (BEV) at SAD
+    float nominal_energy_mev;   // Mean photon beam energy (e.g. 2.0 MeV for 6 MV spectrum)
+    float base_mu_over_rho;     // Water mass attenuation coeff (mu / rho) ~0.063 cm^2 / g = 0.0063 mm^2 / g
+    float sad_mm;               // Source-to-Axis Distance (1000.0 mm)
+    float mu_calibration_factor;// Monitor Unit dose calibration scaling factor
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    // Check if voxel is inside the patient body
+    float body_mask = imageLoad(u_contour_volume, voxel_coord).r;
+    if (body_mask < 0.5) {
+        imageStore(u_terma_volume, voxel_coord, vec4(0.0));
+        return;
+    }
+
+    vec3 voxel_pos_mm = grid_origin_mm + (vec3(voxel_coord) + 0.5) * voxel_spacing_mm;
+
+    // Fetch radiological depth d_eff and distance to source
+    vec4 path_data = imageLoad(u_pathlength_volume, voxel_coord);
+    float d_eff_mm = path_data.r;
+    float dist_to_source_mm = max(1.0, path_data.b);
+
+    // Fetch voxel physical mass density rho (g / cm^3)
+    vec4 density_data = imageLoad(u_density_volume, voxel_coord);
+    float mass_density = density_data.r;
+
+    // Project voxel coordinate into Beam's Eye View (BEV) plane at SAD = 1000 mm
+    // In BEV, ray goes from (0, 0, -SAD) towards (0, 0, 0)
+    vec4 bev_pos = world_to_bev_matrix * vec4(voxel_pos_mm, 1.0);
+    
+    // Perspective projection onto isocenter collimator plane (Z = 0, distance = SAD from source)
+    float z_from_source = bev_pos.z;
+    if (z_from_source <= 10.0) {
+        imageStore(u_terma_volume, voxel_coord, vec4(0.0));
+        return;
+    }
+
+    float proj_scale = sad_mm / z_from_source;
+    vec2 collimator_uv_mm = bev_pos.xy * proj_scale;
+
+    // Normalized texture coordinates for the 400 x 400 mm field map [-200, +200]
+    vec2 map_uv = (collimator_uv_mm / 400.0) + vec2(0.5);
+
+    // Sample primary incident fluence from collimator map (Jaws + MLC + Flattening filter)
+    float incident_fluence_weight = 0.0;
+    if (all(greaterThanEqual(map_uv, vec2(0.0))) && all(lessThanEqual(map_uv, vec2(1.0)))) {
+        incident_fluence_weight = texture(u_collimated_fluence_map, map_uv).r;
+    }
+
+    // Inverse-square divergence falloff: (SAD / dist)^2
+    float inv_sq_factor = (sad_mm / dist_to_source_mm) * (sad_mm / dist_to_source_mm);
+
+    // Primary attenuation through patient along radiological ray path
+    // mu in water ~0.0063 mm^-1 for 6 MV spectrum
+    float primary_attenuation = exp(-base_mu_over_rho * 0.1 * d_eff_mm * (mass_density > 0.01 ? 1.0 : 0.0));
+
+    // Local primary energy fluence Psi(r) in MeV / mm^2 per MU
+    float primary_fluence = incident_fluence_weight * inv_sq_factor * primary_attenuation * mu_calibration_factor;
+
+    // TERMA: T(r) = (mu / rho)(r) * Psi(r)
+    // In water, (mu / rho) ~ 0.063 cm^2 / g
+    float local_mu_over_rho = base_mu_over_rho * (mass_density > 0.01 ? 1.0 : 0.0);
+    float terma_val = local_mu_over_rho * primary_fluence * nominal_energy_mev;
+
+    imageStore(u_terma_volume, voxel_coord, vec4(
+        terma_val,
+        primary_fluence,
+        collimator_uv_mm.x,
+        inv_sq_factor
+    ));
+}

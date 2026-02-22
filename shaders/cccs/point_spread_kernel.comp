@@ -1,0 +1,81 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Collapsed Cone Energy Deposition Point Spread Kernel Parameterization
+ *
+ * Implements the Mack-Papanikolaou and Ahnesjo analytical parameterization
+ * of polyenergetic energy deposition kernels A(r, theta):
+ *   A(r, theta) = (A_theta / r^2) * [ a_theta * exp(-alpha_theta * r) + b_theta * exp(-beta_theta * r) ]
+ *
+ * Evaluates primary electron transport, multiple Coulomb scattering,
+ * and secondary Compton scatter photon propagation coefficients for
+ * discrete conical solid angle sectors across 4pi steradians.
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Output 1D kernel parameter buffer for all discrete cones (e.g. 128 cones)
+// struct ConeKernelParam { vec4 a_alpha_b_beta; vec4 direction_and_weight; };
+layout(std430, binding = 0) buffer KernelParamBuffer {
+    vec4 kernel_coefficients[]; // x = a_theta, y = alpha_theta, z = b_theta, w = beta_theta
+};
+
+layout(std430, binding = 1) buffer KernelDirectionBuffer {
+    vec4 cone_directions_weights[]; // xyz = unit direction, w = solid angle weight (dOmega)
+};
+
+layout(std140, binding = 2) uniform KernelConfig {
+    float nominal_beam_energy_mv; // Linac nominal energy (e.g. 6.0 MV)
+    int   num_cones;              // Total discrete cone count (e.g. 128)
+};
+
+const float PI_VAL = 3.14159265359;
+const float TWO_PI = 6.28318530718;
+
+void main() {
+    uint cone_idx = gl_GlobalInvocationID.x;
+    if (cone_idx >= uint(num_cones)) {
+        return;
+    }
+
+    // Direction vector from Fibonacci sphere lattice
+    float golden_ratio = 1.618033988749895;
+    float i = float(cone_idx) + 0.5;
+    float z = 1.0 - (2.0 * i) / float(num_cones);
+    float radius = sqrt(max(0.0, 1.0 - z * z));
+    float phi = TWO_PI * i / golden_ratio;
+
+    vec3 dir = vec3(radius * cos(phi), radius * sin(phi), z);
+    float solid_angle = (4.0 * PI_VAL) / float(num_cones);
+
+    // Polar scattering angle theta relative to primary forward beam axis (+Z in BEV)
+    float cos_theta = clamp(dir.z, -1.0, 1.0);
+    float theta = acos(cos_theta);
+
+    // Ahnesjo / Papanikolaou parameterized coefficients as a function of polar angle theta:
+    // Forward angles (theta ~ 0) have deep electron penetration and high energy deposition
+    // Backward angles (theta ~ pi) receive only backscattered Compton photons
+    float forward_factor = max(0.0, cos_theta);
+    float backward_factor = max(0.0, -cos_theta);
+
+    // a_theta: Amplitude of electron charged particle transport term
+    // Alpha_theta: Attenuation coefficient of electron buildup (cm^-1)
+    float a_theta = 0.85 * pow(max(0.01, (1.0 + cos_theta) * 0.5), 3.0) + 0.05;
+    float alpha_theta = (nominal_beam_energy_mv > 8.0) ? (1.5 + 2.0 * backward_factor) : (2.2 + 3.0 * backward_factor); // cm^-1
+
+    // b_theta: Amplitude of secondary Compton scatter photon term
+    // Beta_theta: Attenuation coefficient of scattered photons (cm^-1)
+    float b_theta = 0.15 + 0.10 * backward_factor;
+    float beta_theta = 0.08 + 0.04 * forward_factor; // Low attenuation for scattered photons
+
+    // Store in global buffers (converting lengths to mm^-1 by dividing by 10)
+    kernel_coefficients[cone_idx] = vec4(
+        a_theta,
+        alpha_theta * 0.1, // mm^-1
+        b_theta,
+        beta_theta * 0.1   // mm^-1
+    );
+
+    cone_directions_weights[cone_idx] = vec4(dir, solid_angle);
+}

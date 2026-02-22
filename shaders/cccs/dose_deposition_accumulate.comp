@@ -1,0 +1,69 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Collapsed Cone Absorbed Dose Accumulation and Normalization Compute Shader
+ *
+ * Normalizes radiant energy density by local tissue physical mass density:
+ *   D(r) = (1 / rho(r)) * E_radiant(r) * K_calibration * MonitorUnits
+ *
+ * Converts deposited energy from MeV / g into clinical absorbed dose in Gray (Gy = J / kg).
+ * Applies patient boundary masking to enforce zero dose outside external contour.
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// 3D accumulated radiant dose volume (from cone superposition passes)
+layout(binding = 0, r32f) readonly uniform image3D u_radiant_dose_volume;
+
+// 3D calibrated density volume (Channel R = mass density rho in g/cm^3)
+layout(binding = 1, rgba32f) readonly uniform image3D u_density_volume;
+
+// 3D external contour mask
+layout(binding = 2, rgba32f) readonly uniform image3D u_contour_volume;
+
+// Output clinical absorbed dose grid in Gray (Gy)
+// - Channel R: Physical absorbed dose (Gy)
+// - Channel G: Dose relative to prescription (d / D_rx)
+// - Channel B: Local mass density rho
+// - Channel A: Valid tissue indicator (1.0 = valid, 0.0 = air)
+layout(binding = 3, rgba32f) writeonly uniform image3D u_absorbed_dose_volume;
+
+layout(std140, binding = 4) uniform DoseNormConfig {
+    ivec4 volume_dimensions;     // (Nx, Ny, Nz, pad)
+    float prescription_dose_gy;  // Total target prescription dose (e.g. 60.0 Gy or 2.0 Gy/fraction)
+    float monitor_units;         // Delivered beam monitor units (e.g. 250.0 MU)
+    float dose_calibration_coeff;// Physical conversion from MeV/g to Gy per MU (~1.602e-10 * gain)
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    float body_mask = imageLoad(u_contour_volume, voxel_coord).r;
+    if (body_mask < 0.5) {
+        imageStore(u_absorbed_dose_volume, voxel_coord, vec4(0.0));
+        return;
+    }
+
+    float radiant_energy_mev_g = imageLoad(u_radiant_dose_volume, voxel_coord).r;
+    float mass_density = imageLoad(u_density_volume, voxel_coord).r;
+
+    // Guard against division by near-zero density in lung or air pockets
+    float eff_density = max(0.05, mass_density);
+
+    // Absorbed dose: D = (E_radiant / rho) * calibration * MU
+    float absorbed_dose_gy = (radiant_energy_mev_g / eff_density) * dose_calibration_coeff * monitor_units;
+
+    // Relative dose compared to prescription
+    float rel_dose = (prescription_dose_gy > 0.0) ? (absorbed_dose_gy / prescription_dose_gy) : 0.0;
+
+    imageStore(u_absorbed_dose_volume, voxel_coord, vec4(
+        absorbed_dose_gy,
+        rel_dose,
+        mass_density,
+        1.0
+    ));
+}

@@ -1,0 +1,64 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * TERMA Geometric Divergence and Obliquity Correction Compute Shader
+ *
+ * Implements voxel ray-face obliquity correction and finite volume
+ * integration factors for non-coplanar and divergent beam trajectories:
+ * - Siddon exact line-voxel chord length integration
+ * - Beam divergence angle scaling across peripheral voxels
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Input raw TERMA volume
+layout(binding = 0, rgba32f) readonly  uniform image3D u_input_terma;
+
+// Output divergence-corrected TERMA volume
+layout(binding = 1, rgba32f) writeonly uniform image3D u_output_terma;
+
+layout(std140, binding = 2) uniform DivergenceConfig {
+    vec3  source_pos_world_mm;  // Linac source position
+    vec3  grid_origin_mm;       // Voxel (0,0,0) position
+    vec3  voxel_spacing_mm;     // (dx, dy, dz)
+    ivec4 volume_dimensions;    // (Nx, Ny, Nz, pad)
+    float sad_mm;               // 1000 mm
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    vec4 in_terma = imageLoad(u_input_terma, voxel_coord);
+    if (in_terma.r <= 0.0) {
+        imageStore(u_output_terma, voxel_coord, vec4(0.0));
+        return;
+    }
+
+    vec3 voxel_pos_mm = grid_origin_mm + (vec3(voxel_coord) + 0.5) * voxel_spacing_mm;
+    vec3 ray_vec = voxel_pos_mm - source_pos_world_mm;
+    float dist = length(ray_vec);
+    vec3 ray_dir = ray_vec / max(1.0e-5, dist);
+
+    // Calculate obliquity chord length correction factor through voxel:
+    // For a unit cube, the chord length along ray_dir is bounded by min(dx/|dx|, dy/|dy|, dz/|dz|)
+    vec3 abs_dir = max(vec3(1.0e-5), abs(ray_dir));
+    vec3 delta_t = voxel_spacing_mm / abs_dir;
+    float chord_length_mm = min(min(delta_t.x, delta_t.y), delta_t.z);
+    float nominal_length_mm = min(min(voxel_spacing_mm.x, voxel_spacing_mm.y), voxel_spacing_mm.z);
+
+    float obliquity_factor = chord_length_mm / nominal_length_mm;
+    obliquity_factor = clamp(obliquity_factor, 0.8, 1.732); // Max diagonal of a cube is sqrt(3)
+
+    float corrected_terma = in_terma.r * obliquity_factor;
+
+    imageStore(u_output_terma, voxel_coord, vec4(
+        corrected_terma,
+        in_terma.g,
+        obliquity_factor,
+        in_terma.a
+    ));
+}

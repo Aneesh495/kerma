@@ -1,0 +1,91 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Collapsed Cone Ray Superposition Transport Compute Shader
+ *
+ * Propagates secondary radiant energy along discrete coaxial cone lines:
+ * - Sweeps along direction vector Omega_m through 3D volume
+ * - Evaluates recursive exponential transport of primary and scatter radiant energy
+ * - Accretively deposits dose into voxels scaled by local electron density
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// 3D TERMA volume (Channel R = Terma in MeV/g per MU)
+layout(binding = 0, rgba32f) readonly uniform image3D u_terma_volume;
+
+// 3D calibrated density volume (Channel G = relative electron density rho_e)
+layout(binding = 1, rgba32f) readonly uniform image3D u_density_volume;
+
+// Read-write 3D accumulated radiant dose volume
+layout(binding = 2, r32f) uniform image3D u_radiant_dose_volume;
+
+layout(std140, binding = 3) uniform ConeTransportConfig {
+    vec3  cone_direction;        // Unit direction vector for this cone pass
+    float solid_angle_weight;    // Cone solid angle weight dOmega
+    vec4  kernel_params;         // (a_theta, alpha_theta, b_theta, beta_theta) in mm^-1
+    vec3  voxel_spacing_mm;      // (dx, dy, dz)
+    ivec4 volume_dimensions;     // (Nx, Ny, Nz, pad)
+    float max_transport_dist_mm; // Max raymarch distance (~150 mm)
+    int   step_count;            // Number of transport raymarch steps
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    // Raymarch backwards along -cone_direction to gather radiant energy arriving at this voxel
+    // (Gather formulation guarantees embarrassingly parallel collision-free writes)
+    vec3 voxel_center_mm = (vec3(voxel_coord) + 0.5) * voxel_spacing_mm;
+    vec3 step_vector_mm = -cone_direction * (max_transport_dist_mm / float(step_count));
+    float step_length_mm = length(step_vector_mm);
+
+    float a_el   = kernel_params.x;
+    float alpha  = kernel_params.y; // mm^-1
+    float b_scat = kernel_params.z;
+    float beta   = kernel_params.w; // mm^-1
+
+    float cumulative_dose_mev_g = 0.0;
+    float cumulative_eff_dist_mm = 0.0;
+
+    vec3 current_pos_mm = voxel_center_mm;
+    vec3 grid_span_mm = vec3(volume_dimensions.xyz) * voxel_spacing_mm;
+
+    for (int step = 1; step <= step_count; ++step) {
+        current_pos_mm += step_vector_mm;
+
+        // Boundary check
+        if (any(lessThan(current_pos_mm, vec3(0.0))) || any(greaterThanEqual(current_pos_mm, grid_span_mm))) {
+            break;
+        }
+
+        ivec3 source_voxel = ivec3(floor(current_pos_mm / voxel_spacing_mm));
+        source_voxel = clamp(source_voxel, ivec3(0), volume_dimensions.xyz - ivec3(1));
+
+        float terma_source = imageLoad(u_terma_volume, source_voxel).r;
+        if (terma_source <= 0.0) {
+            continue;
+        }
+
+        float local_rho_e = imageLoad(u_density_volume, source_voxel).g;
+        float delta_eff_dist = local_rho_e * step_length_mm;
+        cumulative_eff_dist_mm += delta_eff_dist;
+
+        // Exponential kernel value at cumulative effective distance r_eff:
+        // A(r) = a * exp(-alpha * r) + b * exp(-beta * r)
+        float kernel_val = a_el * exp(-alpha * cumulative_eff_dist_mm) +
+                           b_scat * exp(-beta * cumulative_eff_dist_mm);
+
+        // Radiant energy deposited from source voxel into target voxel
+        // Scaled by O'Connor density factor (rho_e^2) and solid angle weight
+        float deposited = terma_source * kernel_val * (local_rho_e * local_rho_e) * delta_eff_dist * solid_angle_weight;
+        cumulative_dose_mev_g += deposited;
+    }
+
+    // Accumulate into global radiant dose buffer
+    float existing_dose = imageLoad(u_radiant_dose_volume, voxel_coord).r;
+    imageStore(u_radiant_dose_volume, voxel_coord, vec4(existing_dose + cumulative_dose_mev_g, 0.0, 0.0, 0.0));
+}
