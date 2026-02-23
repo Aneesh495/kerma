@@ -1,0 +1,87 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Equivalent Tissue-Air Ratio (ETAR) 3D Scatter Convolution Compute Shader
+ *
+ * Implements Sontag and Cunningham 3D spatial convolution for effective electron density:
+ *   rho_tilde(r) = (sum_k rho_e(r_k) * W(r - r_k)) / (sum_k W(r - r_k))
+ *
+ * Captures lateral scatter perturbations and tissue boundary scattering
+ * beyond 1D rayline approximations.
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Input calibrated density volume (Channel G = rho_e)
+layout(binding = 0, rgba32f) readonly uniform image3D u_density_volume;
+
+// Input uncorrected dose volume
+layout(binding = 1, rgba32f) readonly uniform image3D u_input_dose;
+
+// Output ETAR-corrected dose volume
+layout(binding = 2, rgba32f) writeonly uniform image3D u_output_dose;
+
+layout(std140, binding = 3) uniform ETARConfig {
+    vec3  voxel_spacing_mm;     // Grid pitch
+    ivec4 volume_dimensions;    // (Nx, Ny, Nz, pad)
+    float scatter_radius_mm;    // Lateral scatter weighting kernel radius (~30 mm)
+    int   kernel_half_width;    // Discrete voxel kernel radius (e.g. 4)
+};
+
+void main() {
+    ivec3 center_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(center_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    vec4 in_dose = imageLoad(u_input_dose, center_coord);
+    if (in_dose.r <= 0.0) {
+        imageStore(u_output_dose, center_coord, vec4(0.0));
+        return;
+    }
+
+    float weighted_density_sum = 0.0;
+    float weight_sum = 0.0;
+
+    int r = clamp(kernel_half_width, 1, 6);
+
+    // 3D spatial convolution with exponential lateral scatter weighting function W(r) = exp(-r / R_0) / r
+    for (int dz = -r; dz <= r; ++dz) {
+        for (int dy = -r; dy <= r; ++dy) {
+            for (int dx = -r; dx <= r; ++dx) {
+                ivec3 sample_coord = clamp(center_coord + ivec3(dx, dy, dz), ivec3(0), volume_dimensions.xyz - ivec3(1));
+                vec3 delta_mm = vec3(float(dx), float(dy), float(dz)) * voxel_spacing_mm;
+                float dist_mm = length(delta_mm);
+
+                if (dist_mm > scatter_radius_mm) {
+                    continue;
+                }
+
+                float rho_e = imageLoad(u_density_volume, sample_coord).g;
+
+                // Scatter weight kernel: 1 / (r + epsilon) * exp(-r / R0)
+                float weight = exp(-dist_mm / max(1.0, scatter_radius_mm)) / (dist_mm + 1.0);
+
+                weighted_density_sum += rho_e * weight;
+                weight_sum += weight;
+            }
+        }
+    }
+
+    float rho_tilde = weighted_density_sum / max(1.0e-5, weight_sum);
+
+    // Dose correction factor based on effective density
+    // Dose in low-density lung (rho_tilde < 1) decreases due to lateral electronic disequilibrium
+    float cf_etar = 1.0 + 0.15 * (rho_tilde - 1.0);
+    cf_etar = clamp(cf_etar, 0.7, 1.4);
+
+    float corrected_dose = in_dose.r * cf_etar;
+
+    imageStore(u_output_dose, center_coord, vec4(
+        corrected_dose,
+        rho_tilde,
+        cf_etar,
+        in_dose.a
+    ));
+}

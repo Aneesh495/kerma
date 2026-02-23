@@ -1,0 +1,74 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Linear Boltzmann Transport Multigroup Macroscopic Cross Section Generator
+ *
+ * Computes energy-binned macroscopic cross sections for coupled radiation transport:
+ * - Total macroscopic cross section Sigma_{t,g} (mm^-1)
+ * - In-scattering transfer matrix Sigma_{s,g' -> g} (mm^-1)
+ * - Stopping power and energy transfer fractions
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Input calibrated density volume (R = mass density, G = rho_e, B = Z_eff, A = mat_id)
+layout(binding = 0, rgba32f) readonly uniform image3D u_density_volume;
+
+// Output multigroup cross section volume for selected active energy group:
+// - Channel R: Total macroscopic cross section Sigma_t (mm^-1)
+// - Channel G: Scattering cross section Sigma_s (mm^-1)
+// - Channel B: Absorption cross section Sigma_a = Sigma_t - Sigma_s (mm^-1)
+// - Channel A: Mean energy deposition per collision (MeV)
+layout(binding = 1, rgba32f) writeonly uniform image3D u_group_cross_sections;
+
+layout(std140, binding = 2) uniform LBTECrossSectionConfig {
+    ivec4 volume_dimensions;     // (Nx, Ny, Nz, pad)
+    float group_energy_mev;      // Center energy of active group g (e.g. 2.5 MeV)
+    float group_width_mev;       // Energy bin delta E
+    float water_base_sigma_t;    // Water total cross section at this energy (mm^-1)
+    float water_base_sigma_s;    // Water scattering cross section at this energy (mm^-1)
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    vec4 density_data = imageLoad(u_density_volume, voxel_coord);
+    float mass_density = density_data.r;
+    float rho_e = density_data.g;
+    float z_eff = density_data.b;
+
+    if (mass_density <= 0.001) {
+        // Deep air: negligible attenuation
+        imageStore(u_group_cross_sections, voxel_coord, vec4(1.0e-5, 1.0e-5, 0.0, 0.0));
+        return;
+    }
+
+    // Macroscopic cross sections scale linearly with electron density for Compton scattering:
+    // Sigma_s = Sigma_s,water * rho_e
+    float sigma_s = water_base_sigma_s * rho_e;
+
+    // Photoelectric cross section scales as Z^3.1 / E^3
+    float photo_factor = pow(z_eff / 7.42, 3.1) / pow(max(0.1, group_energy_mev), 3.0);
+    float sigma_photo = 0.0002 * photo_factor * mass_density;
+
+    // Pair production cross section for high energies (> 1.022 MeV) scales as Z^2
+    float pair_factor = (group_energy_mev > 1.022) ? (0.0001 * (group_energy_mev - 1.022) * pow(z_eff / 7.42, 2.0)) : 0.0;
+    float sigma_pair = pair_factor * mass_density;
+
+    float sigma_a = sigma_photo + sigma_pair;
+    float sigma_t = sigma_s + sigma_a;
+
+    // Average energy transferred to medium per collision
+    float mean_energy_dep_mev = (sigma_photo * group_energy_mev + sigma_s * (group_energy_mev * 0.45) + sigma_pair * (group_energy_mev - 1.022)) / max(1.0e-5, sigma_t);
+
+    imageStore(u_group_cross_sections, voxel_coord, vec4(
+        sigma_t,
+        sigma_s,
+        sigma_a,
+        mean_energy_dep_mev
+    ));
+}

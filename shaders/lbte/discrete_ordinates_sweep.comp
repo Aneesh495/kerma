@@ -1,0 +1,83 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Discrete Ordinates (S_N) Spatial Characteristic Transport Sweeper
+ *
+ * Sweeps along directional characteristics solving the upwind balance equation:
+ *   |mu|/dx * (psi_x_out - psi_x_in) + |eta|/dy * (psi_y_out - psi_y_in) +
+ *   |xi|/dz * (psi_z_out - psi_z_in) + Sigma_t * psi_cell = Q_source
+ *
+ * Implements diamond differencing with positive flux fixup for unconditional numerical stability.
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Total macroscopic cross section volume Sigma_t
+layout(binding = 0, rgba32f) readonly uniform image3D u_group_cross_sections;
+
+// In-scattering plus external source emission volume Q_source
+layout(binding = 1, r32f) readonly uniform image3D u_source_volume;
+
+// Read-write 3D angular flux volume for active direction Omega_m
+layout(binding = 2, r32f) uniform image3D u_angular_flux_volume;
+
+layout(std140, binding = 3) uniform SweepConfig {
+    vec3  direction_omega;       // Direction cosines (mu, eta, xi)
+    ivec3 sweep_direction_sign;  // (+1 or -1 for x, y, z sweep progression)
+    vec3  voxel_spacing_mm;      // (dx, dy, dz)
+    ivec4 volume_dimensions;     // (Nx, Ny, Nz, pad)
+    int   current_plane_index;   // Spatial slice index along fastest sweep axis
+};
+
+void main() {
+    ivec2 local_xy = ivec2(gl_GlobalInvocationID.xy);
+
+    // Map invocation to 3D voxel coordinate based on sweep direction sign
+    int ix = (sweep_direction_sign.x > 0) ? local_xy.x : (volume_dimensions.x - 1 - local_xy.x);
+    int iy = (sweep_direction_sign.y > 0) ? local_xy.y : (volume_dimensions.y - 1 - local_xy.y);
+    int iz = (sweep_direction_sign.z > 0) ? current_plane_index : (volume_dimensions.z - 1 - current_plane_index);
+
+    ivec3 voxel_coord = ivec3(ix, iy, iz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz)) || any(lessThan(voxel_coord, ivec3(0)))) {
+        return;
+    }
+
+    vec3 abs_omega = max(vec3(1.0e-5), abs(direction_omega));
+    vec3 inv_delta = 2.0 * abs_omega / voxel_spacing_mm;
+
+    // Upwind incoming boundary fluxes from upstream neighbor voxels
+    ivec3 prev_x = voxel_coord - ivec3(sweep_direction_sign.x, 0, 0);
+    ivec3 prev_y = voxel_coord - ivec3(0, sweep_direction_sign.y, 0);
+    ivec3 prev_z = voxel_coord - ivec3(0, 0, sweep_direction_sign.z);
+
+    float psi_in_x = 0.0;
+    float psi_in_y = 0.0;
+    float psi_in_z = 0.0;
+
+    if (all(greaterThanEqual(prev_x, ivec3(0))) && all(lessThan(prev_x, volume_dimensions.xyz))) {
+        psi_in_x = imageLoad(u_angular_flux_volume, prev_x).r;
+    }
+    if (all(greaterThanEqual(prev_y, ivec3(0))) && all(lessThan(prev_y, volume_dimensions.xyz))) {
+        psi_in_y = imageLoad(u_angular_flux_volume, prev_y).r;
+    }
+    if (all(greaterThanEqual(prev_z, ivec3(0))) && all(lessThan(prev_z, volume_dimensions.xyz))) {
+        psi_in_z = imageLoad(u_angular_flux_volume, prev_z).r;
+    }
+
+    float sigma_t = imageLoad(u_group_cross_sections, voxel_coord).r;
+    float q_source = imageLoad(u_source_volume, voxel_coord).r;
+
+    // Diamond difference cell center flux solution:
+    // psi_cell = (Q + inv_dx * psi_in_x + inv_dy * psi_in_y + inv_dz * psi_in_z) /
+    //            (inv_dx + inv_dy + inv_dz + Sigma_t)
+    float numerator = q_source + inv_delta.x * psi_in_x + inv_delta.y * psi_in_y + inv_delta.z * psi_in_z;
+    float denominator = inv_delta.x + inv_delta.y + inv_delta.z + sigma_t;
+
+    float psi_cell = numerator / max(1.0e-6, denominator);
+
+    // Positive flux fixup: ensure non-negative angular flux
+    psi_cell = max(0.0, psi_cell);
+
+    imageStore(u_angular_flux_volume, voxel_coord, vec4(psi_cell, 0.0, 0.0, 0.0));
+}

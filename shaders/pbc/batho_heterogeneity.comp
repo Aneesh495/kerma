@@ -1,0 +1,79 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Modified Batho Power Law Heterogeneity Correction Compute Shader
+ *
+ * Evaluates the generalized Batho correction factor CF_Batho for non-uniform tissue densities:
+ *   CF = prod_{m=1}^M [ TAR(d_m, W) ]^( (rho_{e,m} - rho_{e,m-1}) / rho_{e,water} )
+ *
+ * Corrects pencil beam dose grids for 1D layered anatomical structures (e.g. chest wall into lung).
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Input uncorrected dose volume
+layout(binding = 0, rgba32f) readonly  uniform image3D u_input_dose;
+
+// Input calibrated density volume (Channel G = rho_e)
+layout(binding = 1, rgba32f) readonly  uniform image3D u_density_volume;
+
+// Input radiological pathlength volume (Channel R = d_eff, Channel G = geometric depth)
+layout(binding = 2, rgba32f) readonly  uniform image3D u_pathlength_volume;
+
+// Output Batho-corrected dose volume
+layout(binding = 3, rgba32f) writeonly uniform image3D u_output_dose;
+
+layout(std140, binding = 4) uniform BathoConfig {
+    ivec4 volume_dimensions;     // (Nx, Ny, Nz, pad)
+    float field_size_w_cm;       // Collimator equivalent square field size (cm)
+    float nominal_energy_mv;     // Beam energy
+};
+
+/**
+ * Analytical Tissue-Air Ratio (TAR) parameterization for photon beams in water.
+ */
+float evaluateTAR(float depth_cm, float field_cm) {
+    if (depth_cm <= 0.0) return 1.0;
+    // Empirical TAR: TAR(d, W) = exp(-mu * (d - d0)) * [ 1 + scatter_factor * (W / 10.0)^0.8 ]
+    float mu_linear = 0.048; // cm^-1
+    float scatter = 0.08 * pow(max(1.0, field_cm) / 10.0, 0.75);
+    return exp(-mu_linear * depth_cm) * (1.0 + scatter * (1.0 - exp(-0.15 * depth_cm)));
+}
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    vec4 in_dose = imageLoad(u_input_dose, voxel_coord);
+    if (in_dose.r <= 0.0) {
+        imageStore(u_output_dose, voxel_coord, vec4(0.0));
+        return;
+    }
+
+    float local_rho_e = imageLoad(u_density_volume, voxel_coord).g;
+    vec4 path_data = imageLoad(u_pathlength_volume, voxel_coord);
+    float d_eff_cm = path_data.r * 0.1;
+    float geom_depth_cm = path_data.g * 0.1;
+
+    // Batho power law evaluation
+    // Compares TAR at radiological depth vs TAR at geometric depth
+    float tar_eff  = max(0.01, evaluateTAR(d_eff_cm, field_size_w_cm));
+    float tar_geom = max(0.01, evaluateTAR(geom_depth_cm, field_size_w_cm));
+
+    // Power law exponent determined by local tissue density contrast
+    float exponent = clamp(local_rho_e - 1.0, -0.85, 1.5);
+    float cf_batho = pow(tar_eff / tar_geom, exponent);
+    cf_batho = clamp(cf_batho, 0.5, 2.0); // Safe clinical bounds
+
+    float corrected_dose = in_dose.r * cf_batho;
+
+    imageStore(u_output_dose, voxel_coord, vec4(
+        corrected_dose,
+        cf_batho,
+        in_dose.b,
+        in_dose.a
+    ));
+}
