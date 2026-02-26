@@ -1,0 +1,82 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Proton Pencil Beam Scanning (PBS) Spot Superposition Compute Shader
+ *
+ * Superposes 3D dose distributions from scanned magnetic spots:
+ *   D_spot(x, y, z) = Weight * D_Bragg(z_eff) * (1 / (2*pi*sigma^2)) * exp(-r_perp^2 / (2*sigma^2))
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// 3D beam envelope volume (Channel R = sigma_r in mm)
+layout(binding = 0, rgba32f) readonly uniform image3D u_beam_envelope_volume;
+
+// Read-write 3D accumulated proton dose volume
+layout(binding = 1, r32f) uniform image3D u_proton_dose_volume;
+
+// Scanned spots buffer:
+// struct ProtonSpot { vec4 x_y_energy_weight; };
+layout(std430, binding = 2) buffer SpotListBuffer {
+    vec4 scanned_spots[]; // x = spot_x_mm, y = spot_y_mm, z = range_mm, w = spot_weight
+};
+
+layout(std140, binding = 3) uniform SpotSuperpositionConfig {
+    vec3  grid_origin_mm;        // Voxel (0,0,0)
+    vec3  voxel_spacing_mm;      // Pitch
+    ivec4 volume_dimensions;     // (Nx, Ny, Nz, pad)
+    int   num_active_spots;      // Total number of spots in current energy layer
+    float bragg_peak_max_dose;   // Peak dose scale factor
+};
+
+const float INV_TWO_PI = 0.15915494309;
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    vec3 voxel_pos_mm = grid_origin_mm + (vec3(voxel_coord) + 0.5) * voxel_spacing_mm;
+    float sigma_r_mm = max(1.0, imageLoad(u_beam_envelope_volume, voxel_coord).r);
+    float two_sigma_sq = 2.0 * sigma_r_mm * sigma_r_mm;
+    float norm_factor = INV_TWO_PI / (sigma_r_mm * sigma_r_mm);
+
+    float accumulated_dose = 0.0;
+
+    for (int i = 0; i < num_active_spots; ++i) {
+        vec4 spot = scanned_spots[i];
+        vec2 spot_xy_mm = spot.xy;
+        float spot_range_mm = spot.z;
+        float spot_weight   = spot.w;
+
+        // Perpendicular distance from spot central axis (assuming beam along +Z)
+        vec2 delta_xy = voxel_pos_mm.xy - spot_xy_mm;
+        float r_perp_sq = dot(delta_xy, delta_xy);
+
+        // Only evaluate within 3 sigma radius
+        if (r_perp_sq > 4.5 * two_sigma_sq) {
+            continue;
+        }
+
+        // Depth relative to spot Bragg peak range
+        float depth_diff = voxel_pos_mm.z - spot_range_mm;
+        float depth_weight = 0.0;
+
+        if (depth_diff < 0.0) {
+            // Plateau region leading up to Bragg peak
+            float z_rel = abs(depth_diff);
+            depth_weight = 0.35 + 0.65 * exp(-z_rel * 0.02);
+        } else if (depth_diff <= 3.0 * sigma_r_mm) {
+            // Bragg peak apex and sharp distal falloff
+            depth_weight = exp(-pow(depth_diff / (1.2 * sigma_r_mm), 2.0));
+        }
+
+        float lateral_weight = norm_factor * exp(-r_perp_sq / two_sigma_sq);
+        accumulated_dose += spot_weight * bragg_peak_max_dose * depth_weight * lateral_weight;
+    }
+
+    float current_dose = imageLoad(u_proton_dose_volume, voxel_coord).r;
+    imageStore(u_proton_dose_volume, voxel_coord, vec4(current_dose + accumulated_dose, 0.0, 0.0, 0.0));
+}

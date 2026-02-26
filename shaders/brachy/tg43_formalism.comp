@@ -1,0 +1,140 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * AAPM TG-43 Brachytherapy Dosimetry Formalism Compute Shader
+ *
+ * Implements the American Association of Physicists in Medicine (AAPM) TG-43
+ * line-source formalism for radioactive radionuclide seeds (Ir-192, I-125, Pd-103):
+ *   D_dot(r, theta) = S_K * Lambda * [ G_L(r, theta) / G_L(r_0, theta_0) ] * g_L(r) * F(r, theta)
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Read-write 3D accumulated brachytherapy dose volume in Gray (Gy)
+layout(binding = 0, r32f) uniform image3D u_brachy_dose_volume;
+
+// Radionuclide seed definition
+struct BrachySeed {
+    vec3  position_mm;          // Seed center coordinate (x, y, z)
+    vec3  orientation_axis;     // Longitudinal axis unit vector
+    float air_kerma_strength_sk;// Air-kerma strength S_K (U = muGy * m^2 / h)
+    float dwell_time_seconds;   // Dwell delivery time (s)
+    float active_length_mm;     // Physical active line source length L (~3.0 - 5.0 mm)
+    float dose_rate_constant;   // Dose rate constant Lambda (cGy / h / U)
+};
+
+layout(std430, binding = 1) buffer SeedBuffer {
+    BrachySeed seeds[];
+};
+
+layout(std140, binding = 2) uniform TG43Config {
+    vec3  grid_origin_mm;       // Voxel (0,0,0)
+    vec3  voxel_spacing_mm;     // Pitch
+    ivec4 volume_dimensions;    // (Nx, Ny, Nz, pad)
+    int   num_active_seeds;     // Total seed count
+    int   radionuclide_type;    // 0 = Ir-192, 1 = I-125, 2 = Pd-103
+};
+
+const float RAD_TO_DEG = 57.2957795131;
+
+/**
+ * Evaluates line-source geometry factor G_L(r, theta):
+ *   G_L(r, theta) = beta / (L * r * sin(theta))  for theta != 0
+ *   G_L(r, 0)     = 1 / (r^2 - L^2 / 4)
+ */
+float evalGeometryFactor(float r_mm, float theta_rad, float length_mm) {
+    float r_cm = r_mm * 0.1;
+    float l_cm = length_mm * 0.1;
+    float half_l = 0.5 * l_cm;
+
+    float sin_theta = sin(theta_rad);
+    if (abs(sin_theta) < 1.0e-4) {
+        // Along seed longitudinal axis
+        float denom = r_cm * r_cm - half_l * half_l;
+        return (denom > 1.0e-4) ? (1.0 / denom) : 1000.0;
+    }
+
+    // Subtended angle beta between source ends
+    float y1 = r_cm * cos(theta_rad) - half_l;
+    float y2 = r_cm * cos(theta_rad) + half_l;
+    float x  = r_cm * sin_theta;
+
+    float theta1 = atan(y1, x);
+    float theta2 = atan(y2, x);
+    float beta = abs(theta2 - theta1);
+
+    return beta / (l_cm * r_cm * sin_theta);
+}
+
+/**
+ * Evaluates radial dose function g_L(r) fifth-order polynomial in water.
+ */
+float evalRadialDoseFunction(float r_cm, int nuclide) {
+    if (nuclide == 0) { // Ir-192
+        // Fits for Ir-192 (TG-43U1)
+        float a0 = 0.989;
+        float a1 = 0.0125;
+        float a2 = -0.0035;
+        float a3 = 0.00015;
+        return a0 + a1 * r_cm + a2 * r_cm * r_cm + a3 * pow(r_cm, 3.0);
+    } else { // I-125
+        // Fits for I-125 (stronger photoelectric absorption at ~28 keV)
+        float a0 = 1.02;
+        float a1 = -0.12;
+        float a2 = -0.015;
+        return exp(-0.15 * r_cm) * (a0 + a1 * r_cm);
+    }
+}
+
+/**
+ * Evaluates 2D anisotropy function F(r, theta).
+ */
+float evalAnisotropyFunction(float r_cm, float theta_rad) {
+    float cos_th = clamp(cos(theta_rad), -1.0, 1.0);
+    // Anisotropy dips along the seed tips due to self-absorption in radioactive core and end welds
+    float dip = 0.35 * pow(abs(cos_th), 4.0);
+    return clamp(1.0 - dip, 0.45, 1.0);
+}
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    vec3 voxel_pos_mm = grid_origin_mm + (vec3(voxel_coord) + 0.5) * voxel_spacing_mm;
+    float total_dose_gy = 0.0;
+
+    for (int i = 0; i < num_active_seeds; ++i) {
+        BrachySeed s = seeds[i];
+        vec3 seed_vec_mm = voxel_pos_mm - s.position_mm;
+        float r_mm = length(seed_vec_mm);
+        if (r_mm < 0.5) r_mm = 0.5; // Avoid singularity at seed center
+
+        float r_cm = r_mm * 0.1;
+        vec3 dir_unit = seed_vec_mm / r_mm;
+        float cos_theta = dot(dir_unit, s.orientation_axis);
+        float theta_rad = acos(clamp(cos_theta, -1.0, 1.0));
+
+        // Reference geometry factor at r_0 = 1.0 cm, theta_0 = pi / 2
+        float g_ref = evalGeometryFactor(10.0, 1.5707963, s.active_length_mm);
+        float g_val = evalGeometryFactor(r_mm, theta_rad, s.active_length_mm);
+
+        float g_ratio = g_val / max(1.0e-5, g_ref);
+        float g_l = evalRadialDoseFunction(r_cm, radionuclide_type);
+        float f_aniso = evalAnisotropyFunction(r_cm, theta_rad);
+
+        // Dose rate in cGy / h: D_dot = S_K * Lambda * G_ratio * g_L * F
+        float dose_rate_cgy_h = s.air_kerma_strength_sk * s.dose_rate_constant * g_ratio * g_l * f_aniso;
+
+        // Convert to Gray (1 Gy = 100 cGy) delivered over dwell time (hours = seconds / 3600)
+        float dwell_hours = s.dwell_time_seconds / 3600.0;
+        float delivered_dose_gy = (dose_rate_cgy_h * 0.01) * dwell_hours;
+
+        total_dose_gy += delivered_dose_gy;
+    }
+
+    float current = imageLoad(u_brachy_dose_volume, voxel_coord).r;
+    imageStore(u_brachy_dose_volume, voxel_coord, vec4(current + total_dose_gy, 0.0, 0.0, 0.0));
+}

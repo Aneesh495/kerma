@@ -1,0 +1,75 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Multi-Catheter High-Dose-Rate (HDR) Seed Lattice Dose Reduction Compute Shader
+ *
+ * Parallel reduction engine accumulating dose from hundreds of dwell positions
+ * across multi-needle interstitial brachytherapy templates.
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Pre-computed 2D TG-43 lookup table
+layout(binding = 0) uniform sampler2D u_anisotropy_lut;
+
+// 3D output dose volume
+layout(binding = 1, r32f) uniform image3D u_brachy_dose_volume;
+
+struct DwellPoint {
+    vec3  pos_mm;
+    vec3  axis_unit;
+    float weight_seconds; // Dwell time (s)
+    float sk_strength;    // Air kerma strength (U)
+};
+
+layout(std430, binding = 2) buffer DwellBuffer {
+    DwellPoint dwell_points[];
+};
+
+layout(std140, binding = 3) uniform LatticeConfig {
+    vec3  grid_origin_mm;
+    vec3  voxel_spacing_mm;
+    ivec4 volume_dimensions;
+    int   total_dwell_points;
+    float dose_rate_constant; // cGy / h / U (~1.108 for Ir-192)
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    vec3 voxel_pos_mm = grid_origin_mm + (vec3(voxel_coord) + 0.5) * voxel_spacing_mm;
+    float accumulated_dose_gy = 0.0;
+
+    for (int i = 0; i < total_dwell_points; ++i) {
+        DwellPoint dp = dwell_points[i];
+        vec3 delta_mm = voxel_pos_mm - dp.pos_mm;
+        float dist_mm = max(0.5, length(delta_mm));
+        float r_cm = dist_mm * 0.1;
+
+        if (r_cm > 10.0) {
+            continue; // Outside clinical influence radius
+        }
+
+        vec3 dir = delta_mm / dist_mm;
+        float cos_theta = clamp(dot(dir, dp.axis_unit), -1.0, 1.0);
+        float theta_rad = acos(cos_theta);
+
+        // Normalize UV into LUT
+        vec2 uv = vec2(r_cm / 10.0, theta_rad / 3.14159265);
+        vec4 lut_data = texture(u_anisotropy_lut, uv);
+        float g_l = lut_data.r;
+        float f_aniso = lut_data.g;
+        float g_ratio = lut_data.b;
+
+        float dose_rate_cgy_h = dp.sk_strength * dose_rate_constant * g_ratio * g_l * f_aniso;
+        float dose_gy = (dose_rate_cgy_h * 0.01) * (dp.weight_seconds / 3600.0);
+        accumulated_dose_gy += dose_gy;
+    }
+
+    float current = imageLoad(u_brachy_dose_volume, voxel_coord).r;
+    imageStore(u_brachy_dose_volume, voxel_coord, vec4(current + accumulated_dose_gy, 0.0, 0.0, 0.0));
+}

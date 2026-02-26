@@ -1,0 +1,82 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Proton Multiple Coulomb Scattering (MCS) Fermi-Eyges Envelope Compute Shader
+ *
+ * Propagates lateral beam spatial width sigma_r(z) and angular spread theta_0(z)
+ * via Fermi-Eyges phase space moments and Highland scattering power:
+ *   sigma_r^2(z) = sigma_init^2 + int_0^z (z - z')^2 * T(z') dz'
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Calibrated density volume (Channel G = relative electron density rho_e)
+layout(binding = 0, rgba32f) readonly uniform image3D u_density_volume;
+
+// 3D stopping power volume
+layout(binding = 1, rgba32f) readonly uniform image3D u_stopping_power_volume;
+
+// Output 3D beam envelope metric volume:
+// - Channel R: Lateral spatial standard deviation sigma_r (mm)
+// - Channel G: Angular divergence standard deviation theta_0 (rad)
+// - Channel B: Projected spot area factor (mm^2)
+// - Channel A: Relative scattering power T(z) / T_water
+layout(binding = 2, rgba32f) writeonly uniform image3D u_beam_envelope_volume;
+
+layout(std140, binding = 3) uniform MCSConfig {
+    vec3  beam_entry_point_mm;   // Entrance position on patient skin
+    vec3  beam_direction;        // Unit direction vector (+Z along beam axis)
+    vec3  grid_origin_mm;        // Voxel (0,0,0)
+    vec3  voxel_spacing_mm;      // Pitch
+    ivec4 volume_dimensions;     // (Nx, Ny, Nz, pad)
+    float initial_spot_sigma_mm; // Initial vacuum nozzle beam spot size (e.g. 3.5 mm)
+    float incident_energy_mev;   // Incident kinetic energy
+    float water_radiation_len_mm;// Radiation length X_0 in water (360.8 mm)
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    vec3 voxel_pos_mm = grid_origin_mm + (vec3(voxel_coord) + 0.5) * voxel_spacing_mm;
+
+    // Vector from skin entrance to voxel
+    vec3 delta_vec = voxel_pos_mm - beam_entry_point_mm;
+    float depth_z_mm = dot(delta_vec, beam_direction);
+
+    if (depth_z_mm <= 0.0) {
+        // Upstream of beam entrance
+        imageStore(u_beam_envelope_volume, voxel_coord, vec4(initial_spot_sigma_mm, 0.0, initial_spot_sigma_mm * initial_spot_sigma_mm * 3.14159, 1.0));
+        return;
+    }
+
+    float local_rho_e = imageLoad(u_density_volume, voxel_coord).g;
+
+    // Highland multiple scattering approximation for scattering power:
+    // T(z) ~ (14.1 / (p * v))^2 * (1 / X_0)
+    // As proton slows down, p * v decreases, causing scattering power T(z) to surge dramatically
+    float kinetic_mev = max(5.0, incident_energy_mev - depth_z_mm * 0.85); // Approximate linear deceleration
+    float beta = sqrt(max(0.01, 1.0 - pow(938.272 / (938.272 + kinetic_mev), 2.0)));
+    float pv_product = beta * beta * (kinetic_mev + 938.272);
+
+    float scattering_power = pow(14.1 / max(10.0, pv_product), 2.0) * (local_rho_e / water_radiation_len_mm);
+
+    // Integrated spatial variance: sigma_r^2 = sigma_0^2 + (1/3) * T * z^3
+    float scatter_variance = (1.0 / 3.0) * scattering_power * pow(depth_z_mm, 3.0);
+    float total_sigma_mm = sqrt(initial_spot_sigma_mm * initial_spot_sigma_mm + scatter_variance);
+
+    // Angular variance: theta_0^2 = T * z
+    float theta_0 = sqrt(max(0.0, scattering_power * depth_z_mm));
+
+    float spot_area = 3.14159265 * total_sigma_mm * total_sigma_mm;
+
+    imageStore(u_beam_envelope_volume, voxel_coord, vec4(
+        total_sigma_mm,
+        theta_0,
+        spot_area,
+        scattering_power * 1000.0 // Scaled for numerical visibility
+    ));
+}

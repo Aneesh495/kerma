@@ -1,0 +1,55 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Brachytherapy 2D Anisotropy Function and Radial Dose Polynomial Generator
+ *
+ * Pre-computes 2D radial dose g_L(r) and 2D anisotropy tables F(r, theta)
+ * using Chebyshev and Legendre polynomial expansions for rapid texture lookups.
+ */
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Output 2D texture (X axis = radius r [0, 10 cm], Y axis = polar angle theta [0, pi])
+// - Channel R: Radial dose function g_L(r)
+// - Channel G: 2D Anisotropy function F(r, theta)
+// - Channel B: Line source geometry factor ratio G_L(r, theta) / G_L(r0, theta0)
+layout(binding = 0, rgba32f) writeonly uniform image2D u_anisotropy_lut;
+
+layout(std140, binding = 1) uniform LUTConfig {
+    ivec2 lut_dimensions;       // (e.g. 256, 180)
+    float max_radius_cm;        // 10.0 cm
+    float source_length_cm;     // Active line length L (0.35 cm)
+};
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(coord, lut_dimensions))) {
+        return;
+    }
+
+    float r_cm = (float(coord.x) + 0.5) * (max_radius_cm / float(lut_dimensions.x));
+    float theta_rad = (float(coord.y) + 0.5) * (3.14159265 / float(lut_dimensions.y));
+
+    // Radial polynomial fit g_L(r) for Ir-192:
+    float g_l = 0.989 + 0.0125 * r_cm - 0.0035 * r_cm * r_cm + 0.00015 * pow(r_cm, 3.0);
+    g_l = clamp(g_l, 0.2, 1.25);
+
+    // 2D Anisotropy F(r, theta):
+    float sin_th = sin(theta_rad);
+    float cos_th = cos(theta_rad);
+    float dip = 0.38 * pow(abs(cos_th), 4.0) * exp(-0.05 * r_cm);
+    float f_aniso = clamp(1.0 - dip, 0.4, 1.0);
+
+    // Geometry ratio
+    float half_l = 0.5 * source_length_cm;
+    float y1 = r_cm * cos_th - half_l;
+    float y2 = r_cm * cos_th + half_l;
+    float x = r_cm * sin_th;
+    float beta = (abs(sin_th) > 1.0e-4) ? abs(atan(y2, x) - atan(y1, x)) : 0.0;
+    float g_val = (abs(sin_th) > 1.0e-4) ? (beta / (source_length_cm * r_cm * sin_th)) : (1.0 / max(0.001, r_cm * r_cm - half_l * half_l));
+    float g_ref = atan(half_l, 1.0) * 2.0 / (source_length_cm * 1.0);
+    float g_ratio = g_val / max(1.0e-5, g_ref);
+
+    imageStore(u_anisotropy_lut, coord, vec4(g_l, f_aniso, g_ratio, 1.0));
+}
