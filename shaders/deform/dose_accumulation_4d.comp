@@ -1,0 +1,63 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * 4D-CT Respiratory Phase Deformable Dose Accumulation Compute Shader
+ *
+ * Warps fractionated dose distributions across respiratory phases (T00 to T90)
+ * back to the reference end-exhale anatomy (T50) with mass preservation:
+ *   D_cumulative(x) += weight_phase * D_phase(x + u(x)) * det(J(x))
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Active respiratory phase dose volume sampler
+layout(binding = 0) uniform sampler3D u_phase_dose_sampler;
+
+// Dense DVF displacement vector field (RGB = ux, uy, uz in mm)
+layout(binding = 1, rgba32f) readonly uniform image3D u_dense_dvf_volume;
+
+// Jacobian metric volume (Channel R = det(J), Channel B = validity flag)
+layout(binding = 2, rgba32f) readonly uniform image3D u_jacobian_volume;
+
+// Read-write cumulative 4D dose volume in Gray
+layout(binding = 3, r32f) uniform image3D u_cumulative_dose_volume;
+
+layout(std140, binding = 4) uniform AccumulationConfig {
+    vec3  voxel_spacing_mm;      // (dx, dy, dz)
+    ivec4 volume_dimensions;     // (Nx, Ny, Nz, pad)
+    float phase_time_weight;     // Fraction of respiratory cycle spent in this phase (e.g. 0.10)
+    int   enforce_mass_conserve; // 1 to multiply by det(J), 0 for simple spatial mapping
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    vec3 voxel_pos_mm = (vec3(voxel_coord) + 0.5) * voxel_spacing_mm;
+
+    // Fetch displacement vector u(x) in mm
+    vec3 displacement_mm = imageLoad(u_dense_dvf_volume, voxel_coord).xyz;
+    vec3 warped_pos_mm = voxel_pos_mm + displacement_mm;
+
+    // Convert warped physical position into normalized [0, 1] texture coordinates
+    vec3 grid_span_mm = vec3(volume_dimensions.xyz) * voxel_spacing_mm;
+    vec3 warped_uv = warped_pos_mm / grid_span_mm;
+
+    float sampled_phase_dose = 0.0;
+    // Check if warped coordinate remains within patient matrix boundaries
+    if (all(greaterThanEqual(warped_uv, vec3(0.0))) && all(lessThanEqual(warped_uv, vec3(1.0)))) {
+        sampled_phase_dose = texture(u_phase_dose_sampler, warped_uv).r;
+    }
+
+    // Mass conservation factor: det(J) accounts for lung expansion/compression
+    float det_J = imageLoad(u_jacobian_volume, voxel_coord).r;
+    float mass_factor = (enforce_mass_conserve != 0) ? clamp(det_J, 0.2, 3.0) : 1.0;
+
+    float weighted_warped_dose = sampled_phase_dose * mass_factor * phase_time_weight;
+
+    float current_cum_dose = imageLoad(u_cumulative_dose_volume, voxel_coord).r;
+    imageStore(u_cumulative_dose_volume, voxel_coord, vec4(current_cum_dose + weighted_warped_dose, 0.0, 0.0, 0.0));
+}

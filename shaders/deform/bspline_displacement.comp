@@ -1,0 +1,86 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * 3D Cubic B-Spline Deformation Vector Field (DVF) Evaluation Compute Shader
+ *
+ * Evaluates smooth, continuous C^2 displacement vector fields u(x, y, z)
+ * from a sparse grid of B-spline tensor product control points:
+ *   u(x) = sum_{l=0}^3 sum_{m=0}^3 sum_{n=0}^3 B_l(u) * B_m(v) * B_n(w) * phi_{i+l, j+m, k+n}
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// 3D texture holding sparse B-spline control point displacements (phi in mm)
+layout(binding = 0) uniform sampler3D u_control_point_grid;
+
+// Output dense 3D deformation vector field (DVF) volume:
+// - Channel RGB: Displacement vector (ux, uy, uz) in millimeters
+// - Channel A: Displacement magnitude |u| (mm)
+layout(binding = 1, rgba32f) writeonly uniform image3D u_dense_dvf_volume;
+
+layout(std140, binding = 2) uniform BSplineConfig {
+    vec3  volume_dimensions;     // Dense CT matrix dimensions (Nx, Ny, Nz)
+    vec3  control_grid_dims;     // Control point grid dimensions (Cx, Cy, Cz)
+    vec3  control_point_spacing; // Spatial pitch between control points (mm)
+    vec3  voxel_spacing_mm;      // Dense CT voxel pitch (mm)
+};
+
+/**
+ * Evaluates the four 1D cubic B-spline basis polynomials at local coordinate u in [0, 1].
+ */
+vec4 evalCubicBSplineBasis(float u) {
+    float u2 = u * u;
+    float u3 = u2 * u;
+
+    float b0 = (1.0 - 3.0 * u + 3.0 * u2 - u3) / 6.0;
+    float b1 = (4.0 - 6.0 * u2 + 3.0 * u3) / 6.0;
+    float b2 = (1.0 + 3.0 * u + 3.0 * u2 - 3.0 * u3) / 6.0;
+    float b3 = u3 / 6.0;
+
+    return vec4(b0, b1, b2, b3);
+}
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, ivec3(volume_dimensions)))) {
+        return;
+    }
+
+    // Physical coordinate of voxel in mm
+    vec3 pos_mm = (vec3(voxel_coord) + 0.5) * voxel_spacing_mm;
+
+    // Continuous coordinate in control point grid space
+    vec3 cp_coord = pos_mm / control_point_spacing;
+    ivec3 cp_base = ivec3(floor(cp_coord)) - ivec3(1);
+    vec3 cp_frac = fract(cp_coord);
+
+    vec4 bx = evalCubicBSplineBasis(cp_frac.x);
+    vec4 by = evalCubicBSplineBasis(cp_frac.y);
+    vec4 bz = evalCubicBSplineBasis(cp_frac.z);
+
+    vec3 displacement_mm = vec3(0.0);
+
+    // 4x4x4 tensor product B-spline interpolation over 64 local control points
+    for (int k = 0; k < 4; ++k) {
+        float wz = bz[k];
+        for (int j = 0; j < 4; ++j) {
+            float wyz = by[j] * wz;
+            for (int i = 0; i < 4; ++i) {
+                float weight = bx[i] * wyz;
+                ivec3 sample_cp = clamp(cp_base + ivec3(i, j, k), ivec3(0), ivec3(control_grid_dims) - ivec3(1));
+                vec3 cp_disp = texelFetch(u_control_point_grid, sample_cp, 0).rgb;
+                displacement_mm += weight * cp_disp;
+            }
+        }
+    }
+
+    float magnitude = length(displacement_mm);
+
+    imageStore(u_dense_dvf_volume, voxel_coord, vec4(
+        displacement_mm.x,
+        displacement_mm.y,
+        displacement_mm.z,
+        magnitude
+    ));
+}

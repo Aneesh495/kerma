@@ -1,0 +1,83 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Deformation Jacobian Determinant and Mass Preservation Compute Shader
+ *
+ * Evaluates the 3x3 spatial transformation Jacobian matrix J = I + nabla u:
+ * - Central difference numerical derivatives of displacement vector field
+ * - Computes determinant det(J) for volumetric tissue compression / expansion
+ * - Enforces mass conservation in dose warping: Dose_warped = Dose_sample * det(J)
+ * - Identifies non-diffeomorphic topology foldings where det(J) <= 0
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Dense DVF volume (RGB = ux, uy, uz in mm)
+layout(binding = 0, rgba32f) readonly uniform image3D u_dense_dvf_volume;
+
+// Output Jacobian metric volume:
+// - Channel R: Jacobian determinant det(J)
+// - Channel G: Volumetric divergence div(u) = dux/dx + duy/dy + duz/dz
+// - Channel B: Diffeomorphic validity flag (1.0 = valid, 0.0 = topology folding)
+// - Channel A: Frobenius norm of deformation gradient ||nabla u||_F
+layout(binding = 1, rgba32f) writeonly uniform image3D u_jacobian_volume;
+
+layout(std140, binding = 2) uniform JacobianConfig {
+    vec3  voxel_spacing_mm;     // (dx, dy, dz)
+    ivec4 volume_dimensions;    // (Nx, Ny, Nz, pad)
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    ivec3 min_bound = ivec3(0);
+    ivec3 max_bound = volume_dimensions.xyz - ivec3(1);
+
+    // Central difference neighbors
+    vec3 u_x_pos = imageLoad(u_dense_dvf_volume, clamp(voxel_coord + ivec3(1, 0, 0), min_bound, max_bound)).xyz;
+    vec3 u_x_neg = imageLoad(u_dense_dvf_volume, clamp(voxel_coord - ivec3(1, 0, 0), min_bound, max_bound)).xyz;
+    vec3 u_y_pos = imageLoad(u_dense_dvf_volume, clamp(voxel_coord + ivec3(0, 1, 0), min_bound, max_bound)).xyz;
+    vec3 u_y_neg = imageLoad(u_dense_dvf_volume, clamp(voxel_coord - ivec3(0, 1, 0), min_bound, max_bound)).xyz;
+    vec3 u_z_pos = imageLoad(u_dense_dvf_volume, clamp(voxel_coord + ivec3(0, 0, 1), min_bound, max_bound)).xyz;
+    vec3 u_z_neg = imageLoad(u_dense_dvf_volume, clamp(voxel_coord - ivec3(0, 0, 1), min_bound, max_bound)).xyz;
+
+    // Partial derivatives: du_i / dx_j
+    vec3 du_dx = (u_x_pos - u_x_neg) / (2.0 * voxel_spacing_mm.x);
+    vec3 du_dy = (u_y_pos - u_y_neg) / (2.0 * voxel_spacing_mm.y);
+    vec3 du_dz = (u_z_pos - u_z_neg) / (2.0 * voxel_spacing_mm.z);
+
+    // 3x3 Deformation Jacobian matrix: J = I + nabla u
+    // Column 0 = (1 + dux/dx, duy/dx, duz/dx)
+    // Column 1 = (dux/dy, 1 + duy/dy, duz/dy)
+    // Column 2 = (dux/dz, duy/dz, 1 + duz/dz)
+    mat3 J = mat3(
+        1.0 + du_dx.x, du_dx.y, du_dx.z,
+        du_dy.x, 1.0 + du_dy.y, du_dy.z,
+        du_dz.x, du_dz.y, 1.0 + du_dz.z
+    );
+
+    // Determinant of 3x3 matrix J
+    float det_J = determinant(J);
+
+    // Volumetric strain divergence
+    float divergence = du_dx.x + du_dy.y + du_dz.z;
+
+    // Topology folding test: det(J) must remain strictly positive for continuous physical deformations
+    float is_diffeomorphic = (det_J > 0.05) ? 1.0 : 0.0;
+
+    // Frobenius norm of strain tensor
+    float frobenius_norm = sqrt(
+        dot(du_dx, du_dx) + dot(du_dy, du_dy) + dot(du_dz, du_dz)
+    );
+
+    imageStore(u_jacobian_volume, voxel_coord, vec4(
+        det_J,
+        divergence,
+        is_diffeomorphic,
+        frobenius_norm
+    ));
+}
