@@ -1,0 +1,61 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Region of Interest (ROI) Voxel Masking Compute Shader
+ *
+ * Classifies CT voxels against planning contours:
+ * - Planning Target Volume (PTV)
+ * - Clinical Target Volume (CTV)
+ * - Organs at Risk (OAR: spinal cord, brainstem, lung, heart, rectum, bladder)
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Output 3D integer ROI label volume
+layout(binding = 0, r32i) writeonly uniform iimage3D u_roi_label_volume;
+
+layout(std140, binding = 1) uniform ROIMaskConfig {
+    vec3  grid_origin_mm;
+    vec3  voxel_spacing_mm;
+    ivec4 volume_dimensions;
+    vec3  roi_box_min_mm;        // Bounding box of target structure
+    vec3  roi_box_max_mm;
+    int   roi_structure_id;      // Unique integer identifier (e.g. 1 = PTV, 2 = Spinal Cord)
+    int   roi_shape_type;        // 0 = AABB Box, 1 = Ellipsoid, 2 = Cylinder
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    vec3 voxel_pos_mm = grid_origin_mm + (vec3(voxel_coord) + 0.5) * voxel_spacing_mm;
+    int is_inside = 0;
+
+    if (roi_shape_type == 0) {
+        // Axis-aligned bounding box
+        if (all(greaterThanEqual(voxel_pos_mm, roi_box_min_mm)) && all(lessThanEqual(voxel_pos_mm, roi_box_max_mm))) {
+            is_inside = roi_structure_id;
+        }
+    } else if (roi_shape_type == 1) {
+        // Analytical 3D ellipsoid target/OAR
+        vec3 center = 0.5 * (roi_box_min_mm + roi_box_max_mm);
+        vec3 radii  = max(vec3(1.0), 0.5 * (roi_box_max_mm - roi_box_min_mm));
+        vec3 normalized_dist = (voxel_pos_mm - center) / radii;
+        if (dot(normalized_dist, normalized_dist) <= 1.0) {
+            is_inside = roi_structure_id;
+        }
+    } else {
+        // Cylindrical spinal cord / esophagus
+        vec3 center = 0.5 * (roi_box_min_mm + roi_box_max_mm);
+        vec2 radii_xy = max(vec2(1.0), 0.5 * (roi_box_max_mm.xy - roi_box_min_mm.xy));
+        vec2 d_xy = (voxel_pos_mm.xy - center.xy) / radii_xy;
+        if (dot(d_xy, d_xy) <= 1.0 && voxel_pos_mm.z >= roi_box_min_mm.z && voxel_pos_mm.z <= roi_box_max_mm.z) {
+            is_inside = roi_structure_id;
+        }
+    }
+
+    imageStore(u_roi_label_volume, voxel_coord, ivec4(is_inside, 0, 0, 0));
+}

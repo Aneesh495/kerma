@@ -1,0 +1,58 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * 3D Euclidean Distance Transform (EDT) Compute Shader
+ *
+ * Evaluates nearest surface distance field to accelerate geometric
+ * Distance-To-Agreement (DTA) calculations in Quality Assurance comparisons.
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Binary boundary surface mask (1.0 = surface edge voxel, 0.0 = interior/exterior)
+layout(binding = 0, r32f) readonly uniform image3D u_surface_mask;
+
+// Output 3D Euclidean distance map (mm)
+layout(binding = 1, r32f) writeonly uniform image3D u_distance_field;
+
+layout(std140, binding = 2) uniform EDTConfig {
+    vec3  voxel_spacing_mm;     // (dx, dy, dz)
+    ivec4 volume_dimensions;    // (Nx, Ny, Nz, pad)
+    int   search_window;        // Search half-width in voxels
+};
+
+void main() {
+    ivec3 center_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(center_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    float is_surface = imageLoad(u_surface_mask, center_coord).r;
+    if (is_surface > 0.5) {
+        imageStore(u_distance_field, center_coord, vec4(0.0));
+        return;
+    }
+
+    float min_dist_sq = 1.0e8;
+    int w = clamp(search_window, 1, 10);
+
+    for (int dz = -w; dz <= w; ++dz) {
+        for (int dy = -w; dy <= w; ++dy) {
+            for (int dx = -w; dx <= w; ++dx) {
+                ivec3 sample_coord = clamp(center_coord + ivec3(dx, dy, dz), ivec3(0), volume_dimensions.xyz - ivec3(1));
+                float surf = imageLoad(u_surface_mask, sample_coord).r;
+                if (surf > 0.5) {
+                    vec3 offset_mm = vec3(float(dx), float(dy), float(dz)) * voxel_spacing_mm;
+                    float dist_sq = dot(offset_mm, offset_mm);
+                    if (dist_sq < min_dist_sq) {
+                        min_dist_sq = dist_sq;
+                    }
+                }
+            }
+        }
+    }
+
+    float final_dist_mm = sqrt(min_dist_sq);
+    imageStore(u_distance_field, center_coord, vec4(final_dist_mm, 0.0, 0.0, 0.0));
+}

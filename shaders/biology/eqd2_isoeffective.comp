@@ -1,0 +1,36 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Isoeffective Dose Translation (EQD2) Compute Shader
+ *
+ * Translates hypo-fractionated and stereotactic body radiation therapy (SBRT)
+ * dose regimes into standard 2-Gy fraction equivalents:
+ *   EQD2 = D * [ (d + alpha/beta) / (2.0 + alpha/beta) ]
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+layout(binding = 0, rgba32f) readonly  uniform image3D u_physical_dose;
+layout(binding = 1, rgba32f) writeonly uniform image3D u_eqd2_output;
+
+layout(std140, binding = 2) uniform IsoeffectiveConfig {
+    ivec4 volume_dimensions;
+    float alpha_beta;           // Radiobiological ratio (e.g. 10.0 for target, 3.0 for OAR)
+    int   fraction_count;       // Prescribed fraction count
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    float d_total = imageLoad(u_physical_dose, voxel_coord).r;
+    float n_fx = max(1.0, float(fraction_count));
+    float d_fraction = d_total / n_fx;
+
+    float eqd2 = d_total * (d_fraction + alpha_beta) / (2.0 + alpha_beta);
+
+    imageStore(u_eqd2_output, voxel_coord, vec4(eqd2, d_fraction, d_total, 1.0));
+}

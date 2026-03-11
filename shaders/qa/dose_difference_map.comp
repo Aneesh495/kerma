@@ -1,0 +1,53 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Voxelwise Dose Difference and Percent Deviation Map Compute Shader
+ *
+ * Computes absolute dose difference (Delta_D = D_calc - D_meas) and
+ * percentage deviation normalized to maximum or prescription dose.
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+layout(binding = 0, rgba32f) readonly uniform image3D u_reference_dose;
+layout(binding = 1, rgba32f) readonly uniform image3D u_evaluated_dose;
+
+// Output 3D difference volume:
+// - Channel R: Absolute dose difference in Gray (D_eval - D_ref)
+// - Channel G: Relative percentage difference (Delta_D / D_norm * 100%)
+// - Channel B: Signed deviation ratio
+// - Channel A: Valid evaluation flag
+layout(binding = 2, rgba32f) writeonly uniform image3D u_difference_volume;
+
+layout(std140, binding = 3) uniform DiffConfig {
+    ivec4 volume_dimensions;
+    float normalization_dose;   // D_max or prescription dose in Gy
+    float low_dose_threshold;   // Suppression threshold
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    float d_ref  = imageLoad(u_reference_dose, voxel_coord).r;
+    float d_eval = imageLoad(u_evaluated_dose, voxel_coord).r;
+
+    if (d_ref < low_dose_threshold && d_eval < low_dose_threshold) {
+        imageStore(u_difference_volume, voxel_coord, vec4(0.0));
+        return;
+    }
+
+    float diff_abs = d_eval - d_ref;
+    float pct_diff = (diff_abs / max(0.1, normalization_dose)) * 100.0;
+    float ratio = (d_ref > 0.01) ? (d_eval / d_ref) : 1.0;
+
+    imageStore(u_difference_volume, voxel_coord, vec4(
+        diff_abs,
+        pct_diff,
+        ratio,
+        1.0
+    ));
+}

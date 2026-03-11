@@ -1,0 +1,67 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Linear-Quadratic (LQ) Biologically Effective Dose (BED) Compute Shader
+ *
+ * Implements the radiobiological LQ model for cell survival:
+ *   BED = D * (1 + d / (alpha / beta))
+ *
+ * Evaluates fractionated tumor kill and late tissue damage:
+ * - Early responding tumors / acute effects (alpha / beta ~ 10 Gy)
+ * - Late responding normal organs at risk (alpha / beta ~ 2 - 3 Gy)
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Input physical absorbed dose volume (Channel R = total physical dose D in Gy)
+layout(binding = 0, rgba32f) readonly uniform image3D u_physical_dose_volume;
+
+// Output radiobiological volume:
+// - Channel R: Biologically Effective Dose (BED in Gy_alpha_beta)
+// - Channel G: Equivalent Dose in 2 Gy fractions (EQD2 in Gy)
+// - Channel B: Predicted fractional cell survival S(D)
+// - Channel A: Effective biological weighting factor BED / D
+layout(binding = 1, rgba32f) writeonly uniform image3D u_bed_volume;
+
+layout(std140, binding = 2) uniform BioConfig {
+    ivec4 volume_dimensions;     // (Nx, Ny, Nz, pad)
+    float alpha_beta_ratio;      // Tissue-specific radiobiological sensitivity (e.g. 10.0 or 2.5 Gy)
+    float alpha_cell_kill;       // Intrinsic radiosensitivity parameter alpha (~0.35 Gy^-1)
+    int   number_of_fractions;   // Fraction count n (e.g. 30 fractions or 5 for SBRT)
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    float total_dose_d = imageLoad(u_physical_dose_volume, voxel_coord).r;
+    if (total_dose_d <= 0.0) {
+        imageStore(u_bed_volume, voxel_coord, vec4(0.0, 0.0, 1.0, 1.0));
+        return;
+    }
+
+    float num_fx = max(1.0, float(number_of_fractions));
+    float dose_per_fraction_d = total_dose_d / num_fx;
+
+    // Biologically Effective Dose (BED)
+    float bed_val = total_dose_d * (1.0 + dose_per_fraction_d / max(0.1, alpha_beta_ratio));
+
+    // Equivalent Dose in 2 Gy fractions (EQD2):
+    // EQD2 = BED / (1 + 2.0 / (alpha / beta))
+    float eqd2_val = bed_val / (1.0 + 2.0 / max(0.1, alpha_beta_ratio));
+
+    // Fraction of surviving clonogenic cells S(D) = exp(-alpha * BED)
+    float cell_survival = exp(-alpha_cell_kill * bed_val);
+
+    float biological_gain = (total_dose_d > 0.01) ? (bed_val / total_dose_d) : 1.0;
+
+    imageStore(u_bed_volume, voxel_coord, vec4(
+        bed_val,
+        eqd2_val,
+        cell_survival,
+        biological_gain
+    ));
+}

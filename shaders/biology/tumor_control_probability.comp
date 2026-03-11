@@ -1,0 +1,47 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Poisson Tumor Control Probability (TCP) Compute Shader
+ *
+ * Evaluates tumor control probability from surviving clonogenic cell density:
+ *   TCP = exp( -N_clonogen * exp( -alpha * BED ) )
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+layout(binding = 0, rgba32f) readonly uniform image3D u_bed_volume;
+layout(binding = 1, r32i)    readonly uniform iimage3D u_roi_label_volume;
+
+// Output 3D TCP density map: Channel R = Local clonogen survival probability
+layout(binding = 2, rgba32f) writeonly uniform image3D u_tcp_volume;
+
+layout(std140, binding = 3) uniform TCPConfig {
+    ivec4 volume_dimensions;
+    int   ptv_roi_id;           // Target structure ID
+    float initial_clonogen_dens;// Number of clonogens per cm^3 (e.g. 1.0e7)
+    float alpha_radiosensitivity;// Radiosensitivity parameter (Gy^-1)
+    float voxel_volume_cc;      // Voxel volume in cm^3
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    int roi = imageLoad(u_roi_label_volume, voxel_coord).r;
+    if (roi != ptv_roi_id) {
+        imageStore(u_tcp_volume, voxel_coord, vec4(0.0));
+        return;
+    }
+
+    float bed = imageLoad(u_bed_volume, voxel_coord).r;
+    float n_0 = initial_clonogen_dens * voxel_volume_cc;
+
+    // Surviving clonogens in this voxel: N_surv = N_0 * exp(-alpha * BED)
+    float surviving_clonogens = n_0 * exp(-alpha_radiosensitivity * bed);
+    float local_tcp = exp(-surviving_clonogens);
+
+    imageStore(u_tcp_volume, voxel_coord, vec4(local_tcp, surviving_clonogens, bed, 1.0));
+}

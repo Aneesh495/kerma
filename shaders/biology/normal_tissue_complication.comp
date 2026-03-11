@@ -1,0 +1,69 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Lyman-Kutcher-Burman (LKB) Normal Tissue Complication Probability (NTCP) Compute Shader
+ *
+ * Implements the LKB probit integration model:
+ *   t = (gEUD - TD50) / (m * TD50)
+ *   NTCP = (1 / sqrt(2*pi)) * int_{-inf}^t exp(-u^2 / 2) du
+ */
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer CumulativeDVHBuffer {
+    vec4 cumulative_curve[1000]; // x = dose_gy, y = volume_percent, z = volume_cc
+};
+
+layout(std430, binding = 1) buffer NTCPOutputBuffer {
+    vec4 ntcp_results; // x = NTCP in percent, y = gEUD in Gy, z = t_probit, w = TD50
+};
+
+layout(std140, binding = 2) uniform LKBConfig {
+    float td50_gy;              // Tolerance dose for 50% complication risk (e.g. 47.0 Gy for spinal cord)
+    float slope_parameter_m;    // Slope of dose-response sigmoid (~0.15)
+    float volume_parameter_n;   // Tissue architecture volume exponent (n ~ 0.05 for serial organs, n ~ 0.8 for parallel)
+};
+
+const float INV_SQRT_TWO_PI = 0.3989422804;
+
+/**
+ * Standard normal cumulative distribution function Phi(t).
+ */
+float standardNormalCDF(float t) {
+    // High-accuracy error function approximation
+    float abs_t = abs(t);
+    float p = 0.2316419;
+    float b1 = 0.319381530;
+    float b2 = -0.356563782;
+    float b3 = 1.781477937;
+    float b4 = -1.821255978;
+    float b5 = 1.330274429;
+
+    float k = 1.0 / (1.0 + p * abs_t);
+    float poly = k * (b1 + k * (b2 + k * (b3 + k * (b4 + k * b5))));
+    float cdf_approx = 1.0 - INV_SQRT_TWO_PI * exp(-0.5 * abs_t * abs_t) * poly;
+
+    return (t >= 0.0) ? cdf_approx : (1.0 - cdf_approx);
+}
+
+void main() {
+    float inv_n = 1.0 / max(0.01, volume_parameter_n);
+
+    // Compute generalized Equivalent Uniform Dose (gEUD):
+    // gEUD = ( sum_k (v_k - v_{k+1}) * D_k^(1/n) )^n
+    float weighted_sum = 0.0;
+    for (int i = 0; i < 999; ++i) {
+        float d_k = cumulative_curve[i].x;
+        float v_diff = max(0.0, cumulative_curve[i].y - cumulative_curve[i + 1].y) * 0.01;
+        weighted_sum += v_diff * pow(max(0.0, d_k), inv_n);
+    }
+
+    float geud = pow(max(0.0, weighted_sum), volume_parameter_n);
+
+    // LKB probit variable t
+    float t_probit = (geud - td50_gy) / max(0.1, slope_parameter_m * td50_gy);
+    float ntcp_pct = standardNormalCDF(t_probit) * 100.0;
+
+    ntcp_results = vec4(ntcp_pct, geud, t_probit, td50_gy);
+}

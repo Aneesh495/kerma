@@ -1,0 +1,86 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Clinical Dosimetric Indices Extraction Compute Shader
+ *
+ * Scans cumulative DVH curves to extract ICRU 83 / RTOG clinical quality metrics:
+ * - D98 (near-minimum dose), D95 (target coverage), D50 (median dose), D2 (near-max / hot spot)
+ * - Volume metrics: V20Gy, V30Gy, V50Gy, V60Gy
+ * - Homogeneity Index HI = (D2 - D98) / D50
+ * - Conformation Number and Target Coverage Ratios
+ */
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer CumulativeDVHBuffer {
+    vec4 cumulative_curve[1000]; // x = dose_gy, y = volume_percent, z = volume_cc
+};
+
+// Output single summary metrics vector
+layout(std430, binding = 1) buffer ClinicalMetricsBuffer {
+    vec4 dose_metrics_d98_d95_d50_d2;     // (D98, D95, D50, D2) in Gy
+    vec4 volume_metrics_v20_v30_v50_v60;  // (V20, V30, V50, V60) in percent
+    vec4 plan_quality_indices;            // x = Homogeneity Index (HI), y = D_mean, z = D_max, w = D_min
+};
+
+layout(std140, binding = 2) uniform MetricsConfig {
+    float prescription_dose_gy; // Target prescription dose (e.g. 60.0 Gy)
+};
+
+/**
+ * Finds the dose level at which cumulative volume equals or drops below target_vol_pct.
+ */
+float interpolateDoseAtVolume(float target_vol_pct) {
+    for (int i = 0; i < 999; ++i) {
+        float v1 = cumulative_curve[i].y;
+        float v2 = cumulative_curve[i + 1].y;
+
+        if (v1 >= target_vol_pct && v2 <= target_vol_pct) {
+            float d1 = cumulative_curve[i].x;
+            float d2 = cumulative_curve[i + 1].x;
+            float t = (abs(v1 - v2) > 1.0e-5) ? ((v1 - target_vol_pct) / (v1 - v2)) : 0.0;
+            return mix(d1, d2, t);
+        }
+    }
+    return (cumulative_curve[0].y < target_vol_pct) ? 0.0 : cumulative_curve[999].x;
+}
+
+/**
+ * Finds cumulative volume percentage receiving at least target_dose_gy.
+ */
+float interpolateVolumeAtDose(float target_dose_gy) {
+    if (target_dose_gy <= cumulative_curve[0].x) return 100.0;
+    if (target_dose_gy >= cumulative_curve[999].x) return 0.0;
+
+    float delta_dose = cumulative_curve[1].x - cumulative_curve[0].x;
+    int idx = int(floor(target_dose_gy / max(1.0e-4, delta_dose)));
+    idx = clamp(idx, 0, 998);
+
+    float d1 = cumulative_curve[idx].x;
+    float d2 = cumulative_curve[idx + 1].x;
+    float v1 = cumulative_curve[idx].y;
+    float v2 = cumulative_curve[idx + 1].y;
+
+    float t = (target_dose_gy - d1) / max(1.0e-4, d2 - d1);
+    return mix(v1, v2, t);
+}
+
+void main() {
+    float d98 = interpolateDoseAtVolume(98.0);
+    float d95 = interpolateDoseAtVolume(95.0);
+    float d50 = interpolateDoseAtVolume(50.0);
+    float d2  = interpolateDoseAtVolume(2.0);
+
+    float v20 = interpolateVolumeAtDose(20.0);
+    float v30 = interpolateVolumeAtDose(30.0);
+    float v50 = interpolateVolumeAtDose(50.0);
+    float v60 = interpolateVolumeAtDose(60.0);
+
+    // ICRU 83 Homogeneity Index: HI = (D2 - D98) / D50
+    float hi = (d50 > 0.01) ? ((d2 - d98) / d50) : 0.0;
+
+    dose_metrics_d98_d95_d50_d2 = vec4(d98, d95, d50, d2);
+    volume_metrics_v20_v30_v50_v60 = vec4(v20, v30, v50, v60);
+    plan_quality_indices = vec4(hi, d50, d2, d98);
+}

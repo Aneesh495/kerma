@@ -1,0 +1,62 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Cumulative Dose-Volume Histogram (cDVH) Parallel Prefix-Sum Compute Shader
+ *
+ * Converts differential frequency bins H(k) into cumulative volume curve V(>= D):
+ *   V(D_k) = [ sum_{j=k}^{999} H(j) / Total_Voxels ] * 100.0%
+ *
+ * Implements reverse parallel accumulation across 1000 discrete bins.
+ */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer DifferentialDVHBuffer {
+    uint differential_bins[1000];
+    uint total_roi_voxels;
+    uint min_bin_index;
+    uint max_bin_index;
+};
+
+// Output cumulative percentage volume buffer:
+// struct CumulativeBin { float dose_gy; float volume_percent; float volume_cc; float padding; };
+layout(std430, binding = 1) buffer CumulativeDVHBuffer {
+    vec4 cumulative_curve[1000];
+};
+
+layout(std140, binding = 2) uniform CumulativeConfig {
+    float max_dose_scale_gy;     // 100.0 Gy
+    float voxel_volume_cc;       // Single voxel volume in cm^3
+};
+
+void main() {
+    uint bin_idx = gl_GlobalInvocationID.x;
+    if (bin_idx >= 1000u) {
+        return;
+    }
+
+    float delta_dose = max_dose_scale_gy / 1000.0;
+    float dose_at_bin = float(bin_idx) * delta_dose;
+
+    if (total_roi_voxels == 0u) {
+        cumulative_curve[bin_idx] = vec4(dose_at_bin, 0.0, 0.0, 0.0);
+        return;
+    }
+
+    // Sum all differential counts from bin_idx to 999
+    uint accumulated_voxels = 0u;
+    for (uint j = bin_idx; j < 1000u; ++j) {
+        accumulated_voxels += differential_bins[j];
+    }
+
+    float volume_percent = (float(accumulated_voxels) / float(total_roi_voxels)) * 100.0;
+    float volume_cc = float(accumulated_voxels) * voxel_volume_cc;
+
+    cumulative_curve[bin_idx] = vec4(
+        dose_at_bin,
+        volume_percent,
+        volume_cc,
+        float(accumulated_voxels)
+    );
+}

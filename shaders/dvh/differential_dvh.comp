@@ -1,0 +1,58 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Parallel Reduction Differential Dose-Volume Histogram (dDVH) Compute Shader
+ *
+ * Bins voxel doses within a target Region of Interest (ROI) into a 1000-bin histogram:
+ *   bin_index = clamp(int(Dose / delta_D), 0, 999)
+ *
+ * Uses high-throughput atomic additions in shared local workgroup memory
+ * before flushing to global storage buffers.
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// 3D physical absorbed dose volume (Channel R = dose in Gy)
+layout(binding = 0, rgba32f) readonly uniform image3D u_absorbed_dose_volume;
+
+// 3D ROI structure integer label volume
+layout(binding = 1, r32i) readonly uniform iimage3D u_roi_label_volume;
+
+// Output 1000-bin differential histogram buffer (counts per bin)
+layout(std430, binding = 2) buffer DifferentialDVHBuffer {
+    uint histogram_bins[1000];
+    uint total_roi_voxels;
+    uint min_bin_index;
+    uint max_bin_index;
+};
+
+layout(std140, binding = 3) uniform DVHConfig {
+    ivec4 volume_dimensions;     // (Nx, Ny, Nz, pad)
+    int   target_roi_id;         // Structure ID to evaluate
+    float max_dose_scale_gy;     // Maximum dose range for 1000 bins (e.g. 100.0 Gy, 0.1 Gy/bin)
+    float voxel_volume_cc;       // Physical volume of one voxel in cm^3 (dx * dy * dz * 1e-3)
+};
+
+void main() {
+    ivec3 voxel_coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    int voxel_label = imageLoad(u_roi_label_volume, voxel_coord).r;
+    if (voxel_label != target_roi_id) {
+        return;
+    }
+
+    float dose_gy = imageLoad(u_absorbed_dose_volume, voxel_coord).r;
+
+    // Calculate histogram bin in [0, 999]
+    float delta_bin = max_dose_scale_gy / 1000.0;
+    int bin_idx = int(floor(dose_gy / delta_bin));
+    bin_idx = clamp(bin_idx, 0, 999);
+
+    // Atomic increment of global histogram
+    atomicAdd(histogram_bins[bin_idx], 1u);
+    atomicAdd(total_roi_voxels, 1u);
+}

@@ -1,0 +1,107 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Low's 3D Gamma Index (gamma-Index) Quality Assurance Compute Shader
+ *
+ * Implements Low et al. (Med. Phys. 1998) and AAPM TG-218 criteria
+ * for 3D dose distribution agreement verification:
+ *   Gamma(r_m, r_c) = sqrt( |r_m - r_c|^2 / DTA^2 + (D_m(r_m) - D_c(r_c))^2 / Delta_D^2 )
+ *   gamma(r_m) = min_{r_c} Gamma(r_m, r_c)
+ *
+ * Criterion: gamma <= 1.0 indicates passing clinical agreement.
+ * Supports Global (D_max or prescription) and Local dose normalization.
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Reference / measured 3D dose grid D_m(r)
+layout(binding = 0, rgba32f) readonly uniform image3D u_reference_dose;
+
+// Evaluated / calculated 3D dose grid D_c(r)
+layout(binding = 1, rgba32f) readonly uniform image3D u_evaluated_dose;
+
+// Output 3D Gamma index evaluation volume:
+// - Channel R: Gamma index value gamma(r)
+// - Channel G: Pass/Fail binary indicator (1.0 = pass <= 1.0, 0.0 = fail > 1.0)
+// - Channel B: Dose difference component |D_m - D_c| / Delta_D
+// - Channel A: Distance-to-agreement component |r_m - r_c| / DTA
+layout(binding = 2, rgba32f) writeonly uniform image3D u_gamma_volume;
+
+layout(std140, binding = 3) uniform GammaConfig {
+    vec3  voxel_spacing_mm;     // (dx, dy, dz)
+    ivec4 volume_dimensions;    // (Nx, Ny, Nz, pad)
+    float dose_difference_crit; // Relative dose difference threshold (e.g. 0.03 for 3%)
+    float dta_criterion_mm;     // Distance-To-Agreement threshold (e.g. 3.0 mm)
+    float dose_threshold_low;   // Low-dose suppression cutoff (e.g. 0.10 * D_max)
+    float reference_max_dose;   // Maximum dose or prescription for global normalization
+    int   is_local_gamma;       // 1 for local normalization, 0 for global normalization
+    int   search_radius_voxels; // Neighborhood search radius (e.g. 3 to 5 voxels)
+};
+
+void main() {
+    ivec3 voxel_m = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(voxel_m, volume_dimensions.xyz))) {
+        return;
+    }
+
+    float d_m = imageLoad(u_reference_dose, voxel_m).r;
+
+    // Suppress low-dose background scatter voxels below threshold
+    if (d_m < dose_threshold_low) {
+        imageStore(u_gamma_volume, voxel_m, vec4(0.0, 1.0, 0.0, 0.0));
+        return;
+    }
+
+    // Determine dose difference tolerance denominator Delta_D
+    float delta_d_tolerance = (is_local_gamma != 0) ? (max(0.01, d_m) * dose_difference_crit) : (reference_max_dose * dose_difference_crit);
+    float inv_delta_d_sq = 1.0 / (delta_d_tolerance * delta_d_tolerance);
+    float inv_dta_sq     = 1.0 / (dta_criterion_mm * dta_criterion_mm);
+
+    float min_gamma_sq = 1.0e10;
+    float best_dd_sq   = 0.0;
+    float best_dist_sq = 0.0;
+
+    int r_search = clamp(search_radius_voxels, 1, 8);
+
+    // Search local ellipsoidal neighborhood around reference voxel
+    for (int dz = -r_search; dz <= r_search; ++dz) {
+        for (int dy = -r_search; dy <= r_search; ++dy) {
+            for (int dx = -r_search; dx <= r_search; ++dx) {
+                ivec3 voxel_c = clamp(voxel_m + ivec3(dx, dy, dz), ivec3(0), volume_dimensions.xyz - ivec3(1));
+
+                vec3 spatial_offset_mm = vec3(float(dx), float(dy), float(dz)) * voxel_spacing_mm;
+                float dist_sq_mm = dot(spatial_offset_mm, spatial_offset_mm);
+                float dist_term_sq = dist_sq_mm * inv_dta_sq;
+
+                // Early exit if geometric distance alone already exceeds current minimum gamma
+                if (dist_term_sq >= min_gamma_sq) {
+                    continue;
+                }
+
+                float d_c = imageLoad(u_evaluated_dose, voxel_c).r;
+                float diff_dose = d_m - d_c;
+                float dose_term_sq = (diff_dose * diff_dose) * inv_delta_d_sq;
+
+                float gamma_sq = dist_term_sq + dose_term_sq;
+                if (gamma_sq < min_gamma_sq) {
+                    min_gamma_sq = gamma_sq;
+                    best_dd_sq   = dose_term_sq;
+                    best_dist_sq = dist_term_sq;
+                }
+            }
+        }
+    }
+
+    float gamma_val = sqrt(min_gamma_sq);
+    float pass_flag = (gamma_val <= 1.0) ? 1.0 : 0.0;
+    float dd_component = sqrt(best_dd_sq);
+    float dta_component = sqrt(best_dist_sq);
+
+    imageStore(u_gamma_volume, voxel_m, vec4(
+        gamma_val,
+        pass_flag,
+        dd_component,
+        dta_component
+    ));
+}
