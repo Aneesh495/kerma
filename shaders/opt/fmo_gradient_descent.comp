@@ -1,0 +1,55 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Fluence Map Optimization (FMO) Projected Gradient Descent Compute Shader
+ *
+ * Minimizes multi-criteria quadratic penalty objective function:
+ *   F(w) = sum_{i in PTV} w_ptv * max(0, D_rx - D_i)^2 +
+ *          sum_{j in OAR} w_oar * max(0, D_j - D_max)^2 +
+ *          gamma * sum_k |nabla w_k|^2 (smoothness regularization)
+ *
+ * Updates beamlet weights: w^{k+1} = max(0, w^k - step_size * nabla F(w^k))
+ */
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// 2D Beamlet fluence map (read-write)
+layout(binding = 0, r32f) uniform image2D u_beamlet_fluence_map;
+
+// 2D Gradient accumulator
+layout(binding = 1, r32f) readonly uniform image2D u_gradient_map;
+
+layout(std140, binding = 2) uniform FMOConfig {
+    ivec2 map_dimensions;       // (e.g. 128 x 128 beamlets)
+    float gradient_step_size;   // Learning rate / step length mu
+    float smoothing_weight_gamma;// Laplaciansmoothness regularization penalty
+    float max_beamlet_fluence;  // Delivery intensity ceiling
+};
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(coord, map_dimensions))) {
+        return;
+    }
+
+    float current_weight = imageLoad(u_beamlet_fluence_map, coord).r;
+    float grad_val = imageLoad(u_gradient_map, coord).r;
+
+    // Discrete 2D Laplacian smoothness gradient: nabla^2 w
+    float w_left  = imageLoad(u_beamlet_fluence_map, clamp(coord + ivec2(-1, 0), ivec2(0), map_dimensions - ivec2(1))).r;
+    float w_right = imageLoad(u_beamlet_fluence_map, clamp(coord + ivec2( 1, 0), ivec2(0), map_dimensions - ivec2(1))).r;
+    float w_down  = imageLoad(u_beamlet_fluence_map, clamp(coord + ivec2(0, -1), ivec2(0), map_dimensions - ivec2(1))).r;
+    float w_up    = imageLoad(u_beamlet_fluence_map, clamp(coord + ivec2(0,  1), ivec2(0), map_dimensions - ivec2(1))).r;
+
+    float laplacian = (w_left + w_right + w_down + w_up) - 4.0 * current_weight;
+    float smoothness_grad = -smoothing_weight_gamma * laplacian;
+
+    float total_grad = grad_val + smoothness_grad;
+
+    // Projected gradient descent with non-negativity: w >= 0
+    float updated_weight = current_weight - gradient_step_size * total_grad;
+    updated_weight = clamp(updated_weight, 0.0, max_beamlet_fluence);
+
+    imageStore(u_beamlet_fluence_map, coord, vec4(updated_weight, 0.0, 0.0, 0.0));
+}

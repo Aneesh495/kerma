@@ -1,0 +1,62 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Cone-Beam CT (CBCT) Projection Scatter Deconvolution Compute Shader
+ *
+ * Corrects wide-beam flat-panel detector projections for Compton scatter contamination:
+ *   P_primary(u, v) = P_total(u, v) - [ P_total * K_scatter ](u, v)
+ *
+ * Restores quantitative Hounsfield Unit fidelity for Online Adaptive Radiotherapy (ART).
+ */
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Raw 2D flat panel CBCT projection image (with scatter)
+layout(binding = 0, r32f) readonly  uniform image2D u_raw_projection;
+
+// Scatter-corrected primary transmission projection
+layout(binding = 1, r32f) writeonly uniform image2D u_corrected_projection;
+
+layout(std140, binding = 2) uniform ScatterConfig {
+    ivec2 projection_dimensions; // (e.g. 1024 x 768)
+    vec2  pixel_pitch_mm;        // (e.g. 0.4 x 0.4 mm)
+    float scatter_fraction_spr;  // Nominal Scatter-to-Primary Ratio (~0.4 - 1.5)
+    float scatter_kernel_fwhm_mm;// Scatter spread function width (~40.0 mm)
+    int   kernel_sample_radius;  // Convolution radius
+};
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(coord, projection_dimensions))) {
+        return;
+    }
+
+    float raw_intensity = imageLoad(u_raw_projection, coord).r;
+
+    // Estimate smooth low-frequency scatter field via Gaussian convolution:
+    float sigma_pixels = (scatter_kernel_fwhm_mm / 2.355) / pixel_pitch_mm.x;
+    float two_sigma_sq = 2.0 * sigma_pixels * sigma_pixels;
+
+    int r = clamp(kernel_sample_radius, 4, 16);
+    float scatter_acc = 0.0;
+    float weight_acc  = 0.0;
+
+    for (int dy = -r; dy <= r; dy += 2) { // Strided sampling for speed
+        for (int dx = -r; dx <= r; dx += 2) {
+            ivec2 sample_c = clamp(coord + ivec2(dx, dy), ivec2(0), projection_dimensions - ivec2(1));
+            float dist_sq = float(dx * dx + dy * dy);
+            float w = exp(-dist_sq / two_sigma_sq);
+
+            scatter_acc += imageLoad(u_raw_projection, sample_c).r * w;
+            weight_acc  += w;
+        }
+    }
+
+    float estimated_scatter = (scatter_acc / max(1.0e-5, weight_acc)) * scatter_fraction_spr;
+
+    // Subtract scatter while preventing negative intensities
+    float primary_intensity = max(0.001, raw_intensity - estimated_scatter);
+
+    imageStore(u_corrected_projection, coord, vec4(primary_intensity, estimated_scatter, raw_intensity, 1.0));
+}

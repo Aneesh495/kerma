@@ -1,0 +1,68 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Online Adaptive Radiotherapy (ART) Deformable Dose Restoration Compute Shader
+ *
+ * Morphs planning segment apertures to adapt to anatomical changes
+ * on the day of treatment (tumor shrinkage, weight loss, organ filling):
+ *   delta_x_leaf(track) = sum_{j} w_j * u_tumor_boundary(x_leaf, y_track)
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Dense DVF from daily CBCT to planning CT (RGB = ux, uy, uz in mm)
+layout(binding = 0, rgba32f) readonly uniform image3D u_dense_dvf_volume;
+
+// Target PTV contour mask on daily anatomy
+layout(binding = 1, r32i) readonly uniform iimage3D u_daily_roi_mask;
+
+// Output restored leaf position offsets buffer
+layout(std430, binding = 2) buffer RestoredLeafBuffer {
+    vec2 adapted_leaf_pairs[]; // x = new_bank_a_mm, y = new_bank_b_mm
+};
+
+layout(std140, binding = 3) uniform RestorationConfig {
+    ivec4 volume_dimensions;
+    vec3  grid_origin_mm;
+    vec3  voxel_spacing_mm;
+    int   num_leaf_pairs;
+    float leaf_width_mm;
+    float leaf_y_origin_mm;
+};
+
+void main() {
+    uint leaf_idx = gl_GlobalInvocationID.x;
+    if (leaf_idx >= uint(num_leaf_pairs)) {
+        return;
+    }
+
+    float y_pos_mm = leaf_y_origin_mm + (float(leaf_idx) + 0.5) * leaf_width_mm;
+
+    // Scan across the target slice to find tumor displacement
+    float shift_a = 0.0;
+    float shift_b = 0.0;
+    float count_samples = 0.0;
+
+    int slice_z = volume_dimensions.z / 2;
+    int voxel_y = clamp(int(floor((y_pos_mm - grid_origin_mm.y) / voxel_spacing_mm.y)), 0, volume_dimensions.y - 1);
+
+    for (int x = 0; x < volume_dimensions.x; x += 4) {
+        ivec3 c = ivec3(x, voxel_y, slice_z);
+        int roi = imageLoad(u_daily_roi_mask, c).r;
+        if (roi == 1) { // Inside target
+            vec3 disp = imageLoad(u_dense_dvf_volume, c).xyz;
+            shift_a += disp.x;
+            shift_b += disp.x;
+            count_samples += 1.0;
+        }
+    }
+
+    if (count_samples > 0.0) {
+        shift_a /= count_samples;
+        shift_b /= count_samples;
+    }
+
+    // Apply adapted margin shifts
+    adapted_leaf_pairs[leaf_idx] = vec2(shift_a, shift_b);
+}

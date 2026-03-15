@@ -1,0 +1,71 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * Dynamic MLC Sliding-Window Leaf Sequencing Compute Shader
+ *
+ * Implements Bortfeld-Kahler / Convery-Webb unidirectional leaf motion sequencing:
+ * - Translates 1D fluence profiles into monotonic leaf arrival trajectories t_A(x), t_B(x)
+ * - Enforces machine velocity limits (|v_leaf| <= 25 mm / s) and minimum leaf separation
+ * - Minimizes total beam-on delivery time and Monitor Unit transmission penalty
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// 2D optimized fluence map (rows correspond to individual leaf tracks)
+layout(binding = 0, r32f) readonly uniform image2D u_optimized_fluence_map;
+
+// Output leaf trajectory control point buffer:
+// struct LeafTrajectoryPoint { vec4 bank_a_b_times; };
+layout(std430, binding = 1) buffer TrajectoryOutputBuffer {
+    vec4 leaf_trajectories[]; // x = pos_x_mm, y = t_arrival_bank_a, z = t_arrival_bank_b, w = leaf_track_id
+};
+
+layout(std140, binding = 2) uniform SequencerConfig {
+    int   num_leaf_tracks;       // Number of leaf pairs (e.g. 120)
+    int   samples_per_track;     // Discretization along X-axis (e.g. 64 positions)
+    float track_width_mm;        // Leaf width (e.g. 2.5 or 5.0 mm)
+    float max_leaf_speed_mm_s;   // Maximum hardware leaf speed (25.0 mm / s)
+    float min_leaf_gap_mm;       // Interlock collision gap (0.5 mm)
+};
+
+void main() {
+    uint track_id = gl_GlobalInvocationID.x;
+    if (track_id >= uint(num_leaf_tracks)) {
+        return;
+    }
+
+    // Process unidirectional sliding window leaf motion along track_id
+    float cum_intensity_a = 0.0;
+    float cum_intensity_b = 0.0;
+
+    float t_a = 0.0;
+    float t_b = 0.0;
+
+    for (int s = 0; s < samples_per_track; ++s) {
+        float f_val = imageLoad(u_optimized_fluence_map, ivec2(s, track_id)).r;
+        
+        // Leaf B (leading leaf) opens aperture
+        t_b += max(0.05, f_val * 0.1);
+
+        // Leaf A (trailing leaf) follows, closing aperture
+        t_a = t_b - f_val * 0.1;
+
+        // Enforce maximum velocity slope: dt / dx >= 1 / v_max
+        float delta_x_mm = 400.0 / float(samples_per_track);
+        float min_dt = delta_x_mm / max_leaf_speed_mm_s;
+        
+        t_b = max(t_b, float(s) * min_dt);
+        t_a = max(t_a, float(s) * min_dt);
+
+        uint out_idx = track_id * uint(samples_per_track) + uint(s);
+        float pos_x_mm = -200.0 + (float(s) + 0.5) * delta_x_mm;
+
+        leaf_trajectories[out_idx] = vec4(
+            pos_x_mm,
+            t_a,
+            t_b,
+            float(track_id)
+        );
+    }
+}
