@@ -33,6 +33,7 @@ target_link_libraries(kerma_cli PRIVATE kerma_core)
 # Test executable
 enable_testing()
 add_executable(kerma_tests
+    cpp/tests/test_runner.cpp
     cpp/tests/test_phantom.cpp
     cpp/tests/test_geometry.cpp
     cpp/tests/test_analytical_dose.cpp
