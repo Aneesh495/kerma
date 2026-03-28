@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy
+
+      - name: Install Vulkan and glslangValidator (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools cmake clang
+
+      - name: Install glslangValidator (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install glslang cmake
+
+      - name: Run Typography Check
+        run: |
+          python3 tools/check_typography.py
+
+      - name: Validate and Compile GLSL Shaders to SPIR-V
+        run: |
+          python3 tools/validate_shaders.py
+
+      - name: Build C++ Core and Test Executable
+        run: |
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          cmake --build . -j4
+
+      - name: Execute C++ Test Suite
+        run: |
+          ./build/kerma_tests
+
+      - name: Execute Python Test Suite
+        run: |
+          PYTHONPATH=python python3 -m unittest discover -s python/tests -v
+
+      - name: Execute CLI Verification Pass
+        run: |
+          ./build/kerma_cli --phantom thorax --gantry 0 --mu 250
