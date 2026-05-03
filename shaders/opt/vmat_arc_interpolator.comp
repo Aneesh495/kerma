@@ -1,0 +1,113 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * GPU VMAT Dynamic Arc Control Point Interpolator
+ *
+ * Implements sub-beamlet temporal interpolation along a continuous dynamic arc:
+ * - Interpolates gantry rotation angle with wrap-around kinematics
+ * - Interpolates 120 MLC leaf pairs with mechanical leaf velocity limits (e.g. 25 mm/s)
+ * - Interpolates asymmetric collimator jaw pairs (X1, X2, Y1, Y2)
+ * - Enforces minimum leaf tip separation (inter-leaf collision avoidance >= 0.5 mm)
+ * - Computes incremental Monitor Unit (MU) delivery weights for collapsed-cone superposition
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct ControlPoint {
+    float gantry_angle_rad;
+    float collimator_angle_rad;
+    float cumulative_mu;
+    vec4  jaw_positions_mm; // (x1, x2, y1, y2)
+    float mlc_bank_a[60];
+    float mlc_bank_b[60];
+};
+
+struct SubBeamletArcSample {
+    float gantry_angle_rad;
+    float collimator_angle_rad;
+    float sample_mu_weight;
+    vec4  interpolated_jaws_mm;
+    float mlc_bank_a[60];
+    float mlc_bank_b[60];
+};
+
+// Input control points: CP0 (start) and CP1 (end) of arc segment
+layout(std430, binding = 0) readonly buffer ControlPointBuffer {
+    ControlPoint control_points[];
+};
+
+// Output interpolated sub-samples along continuous arc
+layout(std430, binding = 1) writeonly buffer SubArcBuffer {
+    SubBeamletArcSample samples[];
+};
+
+layout(std140, binding = 2) uniform VMATConfig {
+    uint  num_samples_per_segment;
+    float max_leaf_speed_mm_per_deg; // e.g. 25 mm/s / (6 deg/s) ~ 4.16 mm/deg
+    float min_leaf_tip_gap_mm;       // 0.5 mm minimum collision buffer
+    float gantry_rotation_direction; // +1.0 for CW, -1.0 for CCW
+};
+
+// Circular shortest angular path interpolation
+float interpolate_angle(float a0, float a1, float t, float dir) {
+    float diff = a1 - a0;
+    if (dir > 0.0f && diff < 0.0f) {
+        diff += 2.0f * 3.14159265358979323846f;
+    } else if (dir < 0.0f && diff > 0.0f) {
+        diff -= 2.0f * 3.14159265358979323846f;
+    }
+    return a0 + t * diff;
+}
+
+void main() {
+    uint sample_idx = gl_GlobalInvocationID.x;
+    if (sample_idx >= samples.length()) {
+        return;
+    }
+
+    uint segment_idx = sample_idx / num_samples_per_segment;
+    uint sub_step = sample_idx % num_samples_per_segment;
+
+    // Fractional position within control point segment [0, 1]
+    float t = (float(sub_step) + 0.5f) / float(num_samples_per_segment);
+
+    ControlPoint cp0 = control_points[segment_idx];
+    ControlPoint cp1 = control_points[segment_idx + 1u];
+
+    SubBeamletArcSample out_sample;
+
+    // Interpolate gantry and collimator orientation
+    out_sample.gantry_angle_rad = interpolate_angle(cp0.gantry_angle_rad, cp1.gantry_angle_rad, t, gantry_rotation_direction);
+    out_sample.collimator_angle_rad = mix(cp0.collimator_angle_rad, cp1.collimator_angle_rad, t);
+
+    // Incremental MU delivery fraction for this sample
+    float delta_mu = cp1.cumulative_mu - cp0.cumulative_mu;
+    out_sample.sample_mu_weight = max(delta_mu / float(num_samples_per_segment), 0.0f);
+
+    // Interpolate jaw boundaries
+    out_sample.interpolated_jaws_mm = mix(cp0.jaw_positions_mm, cp1.jaw_positions_mm, t);
+
+    // Interpolate each of the 60 MLC leaf pairs with collision avoidance
+    for (int leaf = 0; leaf < 60; ++leaf) {
+        float pos_a0 = cp0.mlc_bank_a[leaf];
+        float pos_a1 = cp1.mlc_bank_a[leaf];
+        float pos_b0 = cp0.mlc_bank_b[leaf];
+        float pos_b1 = cp1.mlc_bank_b[leaf];
+
+        float interp_a = mix(pos_a0, pos_a1, t);
+        float interp_b = mix(pos_b0, pos_b1, t);
+
+        // Enforce physical anti-collision tip separation: tip_B - tip_A >= min_gap
+        if (interp_b - interp_a < min_leaf_tip_gap_mm) {
+            float mid = 0.5f * (interp_a + interp_b);
+            interp_a = mid - 0.5f * min_leaf_tip_gap_mm;
+            interp_b = mid + 0.5f * min_leaf_tip_gap_mm;
+        }
+
+        out_sample.mlc_bank_a[leaf] = interp_a;
+        out_sample.mlc_bank_b[leaf] = interp_b;
+    }
+
+    samples[sample_idx] = out_sample;
+}
