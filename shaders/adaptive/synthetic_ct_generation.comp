@@ -1,0 +1,87 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * GPU Synthetic CT (sCT) Generation and Daily Anatomy Override Shader
+ *
+ * Implements:
+ * - Multi-modal fusion between deformed prior planning CT and daily on-board CBCT
+ * - High-gradient anatomical edge preservation via Bilateral filter weighting
+ * - Fast daily gas pocket / air cavity detection and override (-1000 HU)
+ * - Calibrated Hounsfield unit to relative electron density (rho_e) conversion
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+
+// Deformed prior planning CT volume (HU)
+layout(binding = 0, r32f) readonly uniform image3D u_deformed_prior_ct;
+
+// Daily on-board CBCT volume (raw uncalibrated intensity or HU)
+layout(binding = 1, r32f) readonly uniform image3D u_daily_cbct;
+
+// Daily anatomical gas pocket / couch override mask
+layout(binding = 2, r32f) readonly uniform image3D u_override_mask;
+
+// Output calibrated synthetic CT volume (HU in R, rho_e in G)
+layout(binding = 3, rg32f) writeonly uniform image3D u_synthetic_ct_output;
+
+layout(std140, binding = 4) uniform SCTConfig {
+    ivec4 volume_dimensions;
+    float prior_confidence_weight; // e.g. 0.7
+    float cbct_confidence_weight;  // e.g. 0.3
+    float gas_override_hu;         // -1000.0 HU
+    float air_detection_threshold; // -750.0 HU
+    float bilateral_sigma_space;   // Spatial sigma in voxels
+    float bilateral_sigma_range;   // Intensity sigma in HU (~150 HU)
+};
+
+// Bilinear calibration curve: HU to electron density relative to water
+float hu_to_electron_density(float hu) {
+    if (hu < -1000.0f) {
+        return 0.001f;
+    } else if (hu <= 0.0f) {
+        // Air (-1000 HU, rho_e = 0.001) to Water (0 HU, rho_e = 1.0)
+        return 1.0f + hu * 0.000999f;
+    } else if (hu <= 1000.0f) {
+        // Water (0 HU, rho_e = 1.0) to Bone (1000 HU, rho_e = 1.48)
+        return 1.0f + hu * 0.00048f;
+    } else {
+        // High density cortical bone / implants
+        return 1.48f + (hu - 1000.0f) * 0.00035f;
+    }
+}
+
+void main() {
+    ivec3 coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    float prior_hu = imageLoad(u_deformed_prior_ct, coord).r;
+    float daily_hu = imageLoad(u_daily_cbct, coord).r;
+    float mask_val = imageLoad(u_override_mask, coord).r;
+
+    float final_hu;
+
+    // Check for explicit daily contour override (e.g. daily bowel gas or couch removal)
+    if (mask_val > 0.5f) {
+        final_hu = gas_override_hu;
+    } else if (daily_hu < air_detection_threshold && prior_hu > air_detection_threshold) {
+        // Daily CBCT reveals newly developed air pocket not present in planning CT
+        final_hu = daily_hu;
+    } else {
+        // Local edge-preserving bilateral blend
+        float diff = abs(prior_hu - daily_hu);
+        float edge_weight = exp(-0.5f * (diff * diff) / (bilateral_sigma_range * bilateral_sigma_range));
+        
+        // When agreement is strong, blend smoothly; near large structural changes, trust daily CBCT
+        float w_prior = prior_confidence_weight * edge_weight;
+        float w_daily = cbct_confidence_weight + (1.0f - edge_weight);
+        float total_w = w_prior + w_daily;
+
+        final_hu = (w_prior * prior_hu + w_daily * daily_hu) / max(total_w, 1e-4f);
+    }
+
+    float rho_e = hu_to_electron_density(final_hu);
+    imageStore(u_synthetic_ct_output, coord, vec4(final_hu, rho_e, 0.0f, 0.0f));
+}
