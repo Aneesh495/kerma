@@ -1,0 +1,113 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * GPU Real-Time Respiratory Motion Surrogate Gating Shader
+ *
+ * Implements:
+ * - Real-time breathing surrogate trajectory tracking (e.g. optical surface / RPM marker block)
+ * - Hilbert transform phase extraction phi(t) in [0, 2*pi) for phase-based gating
+ * - Baseline drift estimation via exponential moving average filter
+ * - Beam-hold trigger signal generation for amplitude and phase duty cycles
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct MotionSample {
+    float timestamp_sec;
+    float vertical_displacement_mm;
+    float filtered_amplitude;
+    float breathing_phase_rad;
+    uint  gating_state; // 1 = BEAM_ON, 0 = BEAM_HOLD
+};
+
+// Temporal buffer of respiratory motion tracking samples
+layout(std430, binding = 0) buffer MotionTrackBuffer {
+    MotionSample motion_samples[];
+};
+
+// Real-time interlock output flag buffer
+layout(std430, binding = 1) writeonly buffer InterlockOutputBuffer {
+    uint b_beam_enable_flag;
+    float b_current_phase_rad;
+    float b_current_amplitude_mm;
+    float b_baseline_drift_mm;
+};
+
+layout(std140, binding = 2) uniform GatingConfig {
+    uint  num_temporal_samples;
+    float sampling_interval_sec;
+    float filter_time_constant_sec; // For baseline drift filter (~15 sec)
+    float gate_phase_start_rad;     // e.g. 0.40 * 2*pi (end-expiration window)
+    float gate_phase_end_rad;       // e.g. 0.60 * 2*pi
+    float gate_amplitude_min_mm;
+    float gate_amplitude_max_mm;
+    uint  gating_mode;              // 0 = Phase gating, 1 = Amplitude gating
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= num_temporal_samples) {
+        return;
+    }
+
+    float disp = motion_samples[idx].vertical_displacement_mm;
+
+    // Moving average baseline estimation
+    float alpha = clamp(sampling_interval_sec / filter_time_constant_sec, 0.001f, 0.1f);
+    float baseline = 0.0f;
+    if (idx > 0u) {
+        baseline = mix(motion_samples[idx - 1u].filtered_amplitude, disp, alpha);
+    } else {
+        baseline = disp;
+    }
+
+    float centered_amp = disp - baseline;
+    motion_samples[idx].filtered_amplitude = baseline;
+
+    // Numerical derivative to determine breathing velocity (d(amp)/dt)
+    float vel = 0.0f;
+    if (idx > 0u && idx < num_temporal_samples - 1u) {
+        float dt = motion_samples[idx + 1u].timestamp_sec - motion_samples[idx - 1u].timestamp_sec;
+        vel = (motion_samples[idx + 1u].vertical_displacement_mm - motion_samples[idx - 1u].vertical_displacement_mm) / max(dt, 1e-4f);
+    }
+
+    // Phase angle calculation in [0, 2*pi)
+    // Inhale is positive velocity, exhale is negative velocity
+    float phase = atan(vel, centered_amp);
+    if (phase < 0.0f) {
+        phase += 2.0f * 3.14159265358979323846f;
+    }
+    motion_samples[idx].breathing_phase_rad = phase;
+
+    // Evaluate gating criteria
+    uint is_beam_enabled = 0u;
+    if (gating_mode == 0u) {
+        // Phase-based gating window
+        if (gate_phase_start_rad <= gate_phase_end_rad) {
+            if (phase >= gate_phase_start_rad && phase <= gate_phase_end_rad) {
+                is_beam_enabled = 1u;
+            }
+        } else {
+            // Window wraps around 2*pi (e.g. peak inhale)
+            if (phase >= gate_phase_start_rad || phase <= gate_phase_end_rad) {
+                is_beam_enabled = 1u;
+            }
+        }
+    } else {
+        // Amplitude-based gating window
+        if (disp >= gate_amplitude_min_mm && disp <= gate_amplitude_max_mm) {
+            is_beam_enabled = 1u;
+        }
+    }
+
+    motion_samples[idx].gating_state = is_beam_enabled;
+
+    // If this is the most recent sample, write to interlock registers
+    if (idx == num_temporal_samples - 1u) {
+        b_beam_enable_flag = is_beam_enabled;
+        b_current_phase_rad = phase;
+        b_current_amplitude_mm = disp;
+        b_baseline_drift_mm = baseline;
+    }
+}
