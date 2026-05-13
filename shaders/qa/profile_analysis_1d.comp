@@ -1,0 +1,148 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * GPU 1D Beam Profile QA Analyzer (AAPM TG-45 / TG-142 Standards)
+ *
+ * Implements:
+ * - Full-Width at Half-Maximum (FWHM) 50% field width determination
+ * - Left and right penumbra widths (80% to 20% dose fall-off distance)
+ * - AAPM TG-45 flatness evaluation across 80% of nominal field width:
+ *   Flatness = 100% * (D_max - D_min) / (D_max + D_min)
+ * - Point-difference symmetry evaluation:
+ *   Symmetry = 100% * max_x |D(x) - D(-x)| / D_cax
+ * - Off-axis horn ratio evaluation for unflattened (FFF) and flattened photon beams
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Input sampled 1D profile dose buffer
+layout(std430, binding = 0) readonly buffer ProfileDoseBuffer {
+    float b_profile_dose[];
+};
+
+// Output metrics block
+layout(std430, binding = 1) writeonly buffer QAMetricsBuffer {
+    float b_fwhm_mm;
+    float b_penumbra_left_mm;
+    float b_penumbra_right_mm;
+    float b_flatness_percent;
+    float b_symmetry_percent;
+    float b_cax_dose;
+    float b_horn_ratio;
+    uint  b_qa_pass_flag; // 1 if within AAPM TG-142 2% tolerance, 0 otherwise
+};
+
+layout(std140, binding = 2) uniform ProfileConfig {
+    uint  num_points;
+    float sample_pitch_mm;
+    float nominal_field_width_mm;
+    float cax_position_mm;
+    float flatness_tolerance_percent; // Typically 2.0%
+    float symmetry_tolerance_percent; // Typically 2.0%
+};
+
+void main() {
+    // Single workgroup evaluation using shared memory reduction
+    if (gl_GlobalInvocationID.x != 0u) {
+        return;
+    }
+
+    uint cax_idx = uint(round(cax_position_mm / sample_pitch_mm));
+    cax_idx = clamp(cax_idx, 0u, num_points - 1u);
+    float d_cax = b_profile_dose[cax_idx];
+
+    // Find 50%, 80%, and 20% dose thresholds relative to CAX
+    float d_50 = 0.50f * d_cax;
+    float d_80 = 0.80f * d_cax;
+    float d_20 = 0.20f * d_cax;
+
+    // Search left boundary from CAX downwards
+    float x_50_left = 0.0f;
+    float x_80_left = 0.0f;
+    float x_20_left = 0.0f;
+
+    for (uint i = cax_idx; i > 0u; --i) {
+        float d_curr = b_profile_dose[i];
+        float d_prev = b_profile_dose[i - 1u];
+        float x_curr = float(i) * sample_pitch_mm;
+        float x_prev = float(i - 1u) * sample_pitch_mm;
+
+        if (d_curr >= d_50 && d_prev < d_50) {
+            float t = (d_50 - d_prev) / max(d_curr - d_prev, 1e-5f);
+            x_50_left = mix(x_prev, x_curr, t);
+        }
+        if (d_curr >= d_80 && d_prev < d_80) {
+            float t = (d_80 - d_prev) / max(d_curr - d_prev, 1e-5f);
+            x_80_left = mix(x_prev, x_curr, t);
+        }
+        if (d_curr >= d_20 && d_prev < d_20) {
+            float t = (d_20 - d_prev) / max(d_curr - d_prev, 1e-5f);
+            x_20_left = mix(x_prev, x_curr, t);
+        }
+    }
+
+    // Search right boundary from CAX upwards
+    float x_50_right = float(num_points - 1u) * sample_pitch_mm;
+    float x_80_right = x_50_right;
+    float x_20_right = x_50_right;
+
+    for (uint i = cax_idx; i < num_points - 1u; ++i) {
+        float d_curr = b_profile_dose[i];
+        float d_next = b_profile_dose[i + 1u];
+        float x_curr = float(i) * sample_pitch_mm;
+        float x_next = float(i + 1u) * sample_pitch_mm;
+
+        if (d_curr >= d_50 && d_next < d_50) {
+            float t = (d_50 - d_next) / max(d_curr - d_next, 1e-5f);
+            x_50_right = mix(x_next, x_curr, t);
+        }
+        if (d_curr >= d_80 && d_next < d_80) {
+            float t = (d_80 - d_next) / max(d_curr - d_next, 1e-5f);
+            x_80_right = mix(x_next, x_curr, t);
+        }
+        if (d_curr >= d_20 && d_next < d_20) {
+            float t = (d_20 - d_next) / max(d_curr - d_next, 1e-5f);
+            x_20_right = mix(x_next, x_curr, t);
+        }
+    }
+
+    float fwhm = max(x_50_right - x_50_left, 0.0f);
+    float penumbra_l = abs(x_50_left - x_20_left) + abs(x_80_left - x_50_left);
+    float penumbra_r = abs(x_20_right - x_50_right) + abs(x_50_right - x_80_right);
+
+    // Flatness and symmetry across central 80% region
+    float half_80 = 0.40f * nominal_field_width_mm;
+    float d_min = d_cax;
+    float d_max = d_cax;
+    float max_asym = 0.0f;
+
+    uint step_radius = uint(floor(half_80 / sample_pitch_mm));
+    for (uint offset = 1u; offset <= step_radius; ++offset) {
+        if (cax_idx >= offset && cax_idx + offset < num_points) {
+            float d_l = b_profile_dose[cax_idx - offset];
+            float d_r = b_profile_dose[cax_idx + offset];
+
+            d_min = min(d_min, min(d_l, d_r));
+            d_max = max(d_max, max(d_l, d_r));
+
+            float asym = abs(d_l - d_r);
+            max_asym = max(max_asym, asym);
+        }
+    }
+
+    float flatness = 100.0f * (d_max - d_min) / max(d_max + d_min, 1e-4f);
+    float symmetry = 100.0f * max_asym / max(d_cax, 1e-4f);
+    float horn_ratio = d_max / max(d_cax, 1e-4f);
+
+    uint pass_flag = (flatness <= flatness_tolerance_percent && symmetry <= symmetry_tolerance_percent) ? 1u : 0u;
+
+    b_fwhm_mm = fwhm;
+    b_penumbra_left_mm = penumbra_l;
+    b_penumbra_right_mm = penumbra_r;
+    b_flatness_percent = flatness;
+    b_symmetry_percent = symmetry;
+    b_cax_dose = d_cax;
+    b_horn_ratio = horn_ratio;
+    b_qa_pass_flag = pass_flag;
+}
