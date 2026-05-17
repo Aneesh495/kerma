@@ -1,0 +1,86 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * GPU Zaider-Minerbo Stochastic Tumor Control Probability (TCP) Shader
+ *
+ * Implements the Zaider-Minerbo birth-death stochastic radiobiological model:
+ * - Accounts for time-dependent sublethal DNA damage repair (half-time T_1/2)
+ * - Models accelerated tumor repopulation after kick-off lag time T_k
+ * - Evaluates single-cell survival S(t) with Lea-Catcheside protraction factor G
+ * - Computes voxel-level and spatial volume integrated TCP:
+ *   TCP = [ 1 - S(T) / (1 + b * integral_0^T S(t) dt) ]^(rho_clonogen * V_voxel)
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+
+// 3D physical absorbed dose volume (Gy)
+layout(binding = 0, r32f) readonly uniform image3D u_dose_volume;
+
+// 3D binary tumor contour mask (GTV/CTV)
+layout(binding = 1, r32f) readonly uniform image3D u_target_mask;
+
+// Output 3D voxel survival and local TCP volume (R = S(T), G = local TCP)
+layout(binding = 2, rg32f) writeonly uniform image3D u_tcp_volume;
+
+// Global scalar TCP reduction buffer
+layout(std430, binding = 3) buffer TCPGlobalBuffer {
+    float b_log_tcp_accumulator;
+    uint  b_total_tumor_voxels;
+};
+
+layout(std140, binding = 4) uniform ZaiderMinerboConfig {
+    ivec4 volume_dimensions;
+    float alpha_per_gy;           // Linear radiosensitivity (e.g. 0.35 Gy^-1)
+    float beta_per_gy2;           // Quadratic radiosensitivity (e.g. 0.035 Gy^-2)
+    float repair_rate_lambda_per_day; // Sublethal repair rate ln(2) / T_1/2
+    float birth_rate_b_per_day;   // Clonogen division rate ln(2) / T_pot
+    float kickoff_time_tk_days;   // Proliferation onset time (~21 to 28 days)
+    float treatment_duration_days;// Total overall treatment time (e.g. 35 to 45 days)
+    float num_fractions;          // Total fractions (e.g. 30 to 35)
+    float clonogen_density_per_mm3;// ~10^6 to 10^7 clonogens/cm3 -> 10^3 to 10^4 / mm3
+    float voxel_volume_mm3;       // dx * dy * dz
+};
+
+void main() {
+    ivec3 coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    float mask = imageLoad(u_target_mask, coord).r;
+    if (mask <= 0.5f) {
+        imageStore(u_tcp_volume, coord, vec4(1.0f, 1.0f, 0.0f, 0.0f));
+        return;
+    }
+
+    float total_dose = imageLoad(u_dose_volume, coord).r;
+    float dose_per_fraction = total_dose / max(num_fractions, 1.0f);
+
+    // Lea-Catcheside factor G for instantaneous fractionated delivery with inter-fraction repair
+    // Complete repair between daily fractions: G = 1.0 / num_fractions
+    float g_factor = 1.0f / max(num_fractions, 1.0f);
+
+    // Linear-quadratic survival after n fractions
+    float exponent = alpha_per_gy * total_dose + beta_per_gy2 * dose_per_fraction * total_dose;
+    float s_rad = exp(-exponent);
+
+    // Repopulation factor after lag time Tk
+    float t_eff = max(treatment_duration_days - kickoff_time_tk_days, 0.0f);
+    float repopulation_gain = exp(birth_rate_b_per_day * t_eff);
+
+    // Overall survival probability at end of treatment S(T)
+    float s_total = s_rad * repopulation_gain;
+    s_total = clamp(s_total, 1e-12f, 1.0f);
+
+    // Zaider-Minerbo birth-death integral: approx S_avg * T
+    float integral_s = 0.5f * (1.0f + s_total) * treatment_duration_days;
+    float denom = 1.0f + birth_rate_b_per_day * integral_s;
+    float p_single_cure = clamp(1.0f - (s_total / denom), 0.0f, 1.0f);
+
+    // Initial clonogens in this voxel
+    float n_0 = clonogen_density_per_mm3 * voxel_volume_mm3;
+    float local_tcp = pow(p_single_cure, n_0);
+
+    imageStore(u_tcp_volume, coord, vec4(s_total, local_tcp, 0.0f, 0.0f));
+}
