@@ -1,0 +1,84 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * GPU Schneider Organ Equivalent Dose (OED) and Secondary Cancer Risk Shader
+ *
+ * Implements the Schneider mechanistic secondary cancer risk formalism (BEIR VII):
+ * - Evaluates Organ Equivalent Dose (OED) across 3D non-target organs at risk
+ * - Linear-exponential, plateau, and full mechanistic cell sterilization models
+ * - Computes Lifetime Attributable Risk (LAR) of secondary malignancy:
+ *   LAR = beta_organ * OED * exp(gamma_e * (age_exposure - 30) + gamma_a * ln(age_attained / 60))
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+
+// 3D physical absorbed dose volume (Gy)
+layout(binding = 0, r32f) readonly uniform image3D u_dose_volume;
+
+// 3D organ of risk binary contour mask
+layout(binding = 1, r32f) readonly uniform image3D u_oar_mask;
+
+// Output 3D voxel OED and local attributable risk density (R = OED Gy, G = LAR %)
+layout(binding = 2, rg32f) writeonly uniform image3D u_oed_volume;
+
+layout(std140, binding = 3) uniform SchneiderRiskConfig {
+    ivec4 volume_dimensions;
+    float alpha_cell_kill_per_gy; // Alpha parameter for cell kill (~0.05 to 0.15 Gy^-1)
+    float delta_plateau_per_gy;   // Plateau parameter
+    float repopulation_factor_r;  // Recovery/repopulation parameter in [0, 1]
+    float beta_lar_per_gy;        // Baseline risk coefficient per Gy (e.g. 0.05 / Gy)
+    float gamma_exposure_age;     // Age-at-exposure risk modification coefficient (-0.024)
+    float gamma_attained_age;     // Attained age exponent
+    float age_at_exposure_years;  // Patient age during treatment
+    float attained_age_years;     // Follow-up evaluation age (e.g. 70 years)
+    uint  model_type;             // 0 = Linear-exponential, 1 = Plateau, 2 = Full mechanistic
+};
+
+// Evaluate voxel-level OED based on model choice
+float evaluate_voxel_oed(float dose_gy) {
+    if (dose_gy <= 0.0f) {
+        return 0.0f;
+    }
+
+    if (model_type == 0u) {
+        // Linear-exponential model
+        // OED = (1.0 / alpha) * (1.0 - exp(-alpha * D))
+        return (1.0f - exp(-alpha_cell_kill_per_gy * dose_gy)) / max(alpha_cell_kill_per_gy, 1e-4f);
+    } else if (model_type == 1u) {
+        // Plateau model
+        // OED = (1.0 / delta) * (1.0 - exp(-delta * D))
+        return (1.0f - exp(-delta_plateau_per_gy * dose_gy)) / max(delta_plateau_per_gy, 1e-4f);
+    } else {
+        // Full mechanistic model with fractionation and repopulation
+        float kill_term = exp(-alpha_cell_kill_per_gy * dose_gy);
+        float repop_term = 1.0f + repopulation_factor_r * (1.0f - kill_term);
+        return dose_gy * kill_term * repop_term;
+    }
+}
+
+void main() {
+    ivec3 coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    float mask = imageLoad(u_oar_mask, coord).r;
+    if (mask <= 0.5f) {
+        imageStore(u_oed_volume, coord, vec4(0.0f, 0.0f, 0.0f, 0.0f));
+        return;
+    }
+
+    float dose_gy = imageLoad(u_dose_volume, coord).r;
+    float oed_voxel = evaluate_voxel_oed(dose_gy);
+
+    // BEIR VII age-at-exposure and attained-age scaling factor
+    float delta_exp_age = age_at_exposure_years - 30.0f;
+    float attained_ratio = max(attained_age_years / 60.0f, 0.1f);
+    float age_modifier = exp(gamma_exposure_age * delta_exp_age + gamma_attained_age * log(attained_ratio));
+
+    // Lifetime Attributable Risk percentage
+    float lar_percent = 100.0f * beta_lar_per_gy * oed_voxel * age_modifier;
+
+    imageStore(u_oed_volume, coord, vec4(oed_voxel, lar_percent, 0.0f, 0.0f));
+}
