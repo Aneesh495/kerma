@@ -1,0 +1,33 @@
+{
+  "phantom_id": "WATER_CUBE_30CM",
+  "description": "Standard 300x300x300 mm homogeneous liquid water calibration phantom",
+  "dimensions": [128, 128, 128],
+  "voxel_spacing_mm": [2.5, 2.5, 2.5],
+  "origin_mm": [-160.0, -160.0, -160.0],
+  "default_material": "WATER_LIQUID",
+  "reference_conditions": {
+    "source_to_surface_distance_mm": 1000.0,
+    "reference_depth_mm": 100.0,
+    "nominal_field_size_mm": [100.0, 100.0]
+  },
+  "structures": [
+    {
+      "roi_id": 1,
+      "name": "EXTERNAL",
+      "type": "BODY",
+      "hu_nominal": 0.0,
+      "electron_density_rel": 1.0,
+      "color_rgba": [0.3, 0.7, 0.9, 0.4]
+    },
+    {
+      "roi_id": 2,
+      "name": "ION_CHAMBER_CAV",
+      "type": "TARGET",
+      "hu_nominal": -1000.0,
+      "electron_density_rel": 0.001,
+      "color_rgba": [1.0, 0.2, 0.2, 0.8],
+      "center_mm": [0.0, 0.0, -100.0],
+      "radius_mm": 3.0
+    }
+  ]
+}

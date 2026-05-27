@@ -1,0 +1,67 @@
+{
+  "phantom_id": "ANTHRO_PELVIS_PROSTATE",
+  "description": "Anthropomorphic digital pelvis phantom for prostate VMAT and IMRT planning",
+  "dimensions": [160, 160, 120],
+  "voxel_spacing_mm": [2.0, 2.0, 2.5],
+  "origin_mm": [-160.0, -160.0, -150.0],
+  "structures": [
+    {
+      "roi_id": 1,
+      "name": "EXTERNAL",
+      "type": "BODY",
+      "hu_nominal": -40.0,
+      "electron_density_rel": 0.96,
+      "color_rgba": [0.4, 0.8, 0.4, 0.3]
+    },
+    {
+      "roi_id": 2,
+      "name": "PTV_PROSTATE",
+      "type": "TARGET",
+      "hu_nominal": 35.0,
+      "electron_density_rel": 1.04,
+      "color_rgba": [1.0, 0.1, 0.1, 0.9],
+      "center_mm": [0.0, 10.0, 0.0],
+      "radii_mm": [22.0, 18.0, 20.0]
+    },
+    {
+      "roi_id": 3,
+      "name": "RECTUM",
+      "type": "ORGAN",
+      "hu_nominal": 10.0,
+      "electron_density_rel": 1.01,
+      "color_rgba": [0.8, 0.5, 0.2, 0.7],
+      "center_mm": [0.0, 36.0, 0.0],
+      "radii_mm": [14.0, 14.0, 60.0]
+    },
+    {
+      "roi_id": 4,
+      "name": "BLADDER",
+      "type": "ORGAN",
+      "hu_nominal": 15.0,
+      "electron_density_rel": 1.01,
+      "color_rgba": [1.0, 0.9, 0.2, 0.7],
+      "center_mm": [0.0, -22.0, 18.0],
+      "radii_mm": [32.0, 30.0, 35.0]
+    },
+    {
+      "roi_id": 5,
+      "name": "FEMORAL_HEAD_L",
+      "type": "ORGAN",
+      "hu_nominal": 550.0,
+      "electron_density_rel": 1.42,
+      "color_rgba": [0.2, 0.6, 0.9, 0.7],
+      "center_mm": [68.0, 12.0, -10.0],
+      "radii_mm": [24.0, 24.0, 25.0]
+    },
+    {
+      "roi_id": 6,
+      "name": "FEMORAL_HEAD_R",
+      "type": "ORGAN",
+      "hu_nominal": 550.0,
+      "electron_density_rel": 1.42,
+      "color_rgba": [0.2, 0.6, 0.9, 0.7],
+      "center_mm": [-68.0, 12.0, -10.0],
+      "radii_mm": [24.0, 24.0, 25.0]
+    }
+  ]
+}
