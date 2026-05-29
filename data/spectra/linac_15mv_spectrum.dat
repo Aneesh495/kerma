@@ -1,0 +1,22 @@
+# Kerma Linear Accelerator Bremsstrahlung Energy Spectrum
+# Beam: 15 MV Flattened (Tungsten target, Flattening Filter, Ion Chamber)
+# Columns: Energy_Bin_Center_MeV, Relative_Fluence_dPhi_dE, Mean_Energy_MeV
+0.25 0.0062 0.25
+0.50 0.0215 0.50
+1.00 0.0542 1.00
+1.50 0.0789 1.50
+2.00 0.0921 2.00
+2.50 0.0975 2.50
+3.00 0.0968 3.00
+4.00 0.0862 4.00
+5.00 0.0718 5.00
+6.00 0.0574 6.00
+7.00 0.0446 7.00
+8.00 0.0338 8.00
+9.00 0.0249 9.00
+10.00 0.0177 10.00
+11.00 0.0121 11.00
+12.00 0.0078 12.00
+13.00 0.0046 13.00
+14.00 0.0022 14.00
+15.00 0.0005 15.00
