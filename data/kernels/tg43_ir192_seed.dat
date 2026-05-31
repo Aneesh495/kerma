@@ -1,0 +1,43 @@
+# AAPM TG-43 Dosimetry Parameters for HDR Iridium-192 (microSelectron-v2)
+# Reference: D. Granero et al., Med. Phys. 33, 4578-4588 (2006)
+# Dose Rate Constant Lambda = 1.109 cGy / (h * U)
+# Active length L = 3.6 mm, Core diameter = 0.6 mm
+#
+# SECTION 1: Radial Dose Function g_L(r)
+# r_cm, g_L(r)
+[RADIAL_DOSE_FUNCTION]
+0.25 1.006
+0.50 1.004
+0.75 1.002
+1.00 1.000
+1.50 0.994
+2.00 0.985
+3.00 0.962
+4.00 0.932
+5.00 0.898
+6.00 0.860
+8.00 0.776
+10.0 0.687
+
+# SECTION 2: 2D Anisotropy Function F(r, theta) at r = 1.0 cm
+# theta_deg, F(1.0cm, theta)
+[ANISOTROPY_FUNCTION_1CM]
+0.0   0.628
+5.0   0.655
+10.0  0.724
+15.0  0.801
+20.0  0.862
+30.0  0.938
+45.0  0.982
+60.0  0.995
+75.0  0.999
+90.0  1.000
+105.0 0.999
+120.0 0.995
+135.0 0.982
+150.0 0.938
+160.0 0.862
+165.0 0.801
+170.0 0.724
+175.0 0.655
+180.0 0.628
