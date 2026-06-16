@@ -22,6 +22,7 @@ add_library(kerma_core
     cpp/src/analytical_dose.cpp
     cpp/src/gamma_evaluation.cpp
     cpp/src/dvh_analyzer.cpp
+    cpp/src/tg43_model.cpp
 )
 
 # CLI executable
@@ -38,6 +39,8 @@ add_executable(kerma_tests
     cpp/tests/test_geometry.cpp
     cpp/tests/test_analytical_dose.cpp
     cpp/tests/test_gamma.cpp
+    cpp/tests/test_tg43.cpp
+    cpp/tests/test_dvh.cpp
 )
 target_link_libraries(kerma_tests PRIVATE kerma_core)
 add_test(NAME AllTests COMMAND kerma_tests)
