@@ -66,12 +66,14 @@ float MaterialsDatabase::mass_attenuation_cm2_g(uint32_t material_id, float ener
     float sigma_kn = 2.0f * 3.14159265f * (2.81794032e-13f * 2.81794032e-13f) *
                      (sigma_kn_term1 + sigma_kn_term2);
 
-    float electrons_per_gram = 3.007e23f * mat.electron_density_rel_water / mat.mass_density_g_cm3;
+    // Water contains N_A * (10 / 18.01528) = 3.3428e23 electrons/g.
+    // Scaling by (electron_density_rel_water / mass_density_g_cm3) yields electrons/g for any medium.
+    float electrons_per_gram = 3.3428e23f * mat.electron_density_rel_water / mat.mass_density_g_cm3;
     float mu_rho_compton = sigma_kn * electrons_per_gram;
 
     float mu_rho_pe = 0.0f;
     if (energy_mev > 0.01f) {
-        mu_rho_pe = 2.1e-5f * std::pow(z_eff, 3.8f) / std::pow(energy_mev, 3.1f);
+        mu_rho_pe = 1.5e-9f * std::pow(z_eff, 3.8f) / std::pow(energy_mev, 3.1f);
     }
 
     float mu_rho_pair = 0.0f;

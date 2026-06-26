@@ -202,14 +202,14 @@ float nist_mass_attenuation(uint material_id, float energy_mev) {
     float sigma_kn = 2.0f * 3.14159265f * (2.81794032e-13f * 2.81794032e-13f) * (sigma_kn_term1 + sigma_kn_term2); // cm2
     
     // Convert cross-section per electron to cm2/g
-    // Number of electrons per gram = N_A * (Z/A) ~ 3.0e23 electrons/g for soft tissue
-    float electrons_per_gram = 3.007e23f * mat.electron_density_rel_water / mat.mass_density_g_cm3;
+    // Water contains N_A * (10 / 18.01528) = 3.3428e23 electrons/g.
+    float electrons_per_gram = 3.3428e23f * mat.electron_density_rel_water / mat.mass_density_g_cm3;
     float mu_rho_compton = sigma_kn * electrons_per_gram;
 
-    // Photoelectric mass attenuation: scales approximately as Z^3.8 / E^3.1
+    // Photoelectric mass attenuation: scales approximately as Z^3.8 / E_MeV^3.1
     float mu_rho_pe = 0.0f;
     if (energy_mev > 0.01f) {
-        mu_rho_pe = 2.1e-5f * pow(z_eff, 3.8f) / pow(energy_mev, 3.1f);
+        mu_rho_pe = 1.5e-9f * pow(z_eff, 3.8f) / pow(energy_mev, 3.1f);
     }
 
     // Pair production mass attenuation: threshold at 1.022 MeV, scales as Z * log(2E)
