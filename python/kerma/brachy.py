@@ -111,7 +111,8 @@ def calculate_brachy_lattice_dose(
     dose_gy = (total_rate_cgy_h * dwell_hours * 0.01).astype(np.float32)
 
     return DoseVolume3D(
-        dose_gy=dose_gy,
+        dimensions=phantom.dimensions,
         spacing_mm=phantom.spacing_mm,
         origin_mm=phantom.origin_mm,
+        dose_gy=dose_gy,
     )
