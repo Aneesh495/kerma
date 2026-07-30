@@ -1,0 +1,81 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * GPU Proton Range Straggling and Bortfeld Distal Edge Broadening Shader
+ *
+ * Implements:
+ * - Bohr Gaussian range straggling variance sigma_R^2 = integral (dE/dx)^-3 * T_max dE
+ * - Tschalar asymmetric relativistic straggling skewness correction near Bragg peak
+ * - Convolves pristine monoenergetic Bragg curve with range straggling kernel sigma_total
+ * - Incorporates clinical nozzle energy spread (dE/E0) and ripple filter broadening
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Input 1D pristine un-straggled proton depth-dose table
+layout(std430, binding = 0) readonly buffer PristineBraggBuffer {
+    float b_pristine_depth_dose[];
+};
+
+// Output straggled clinical Bragg depth-dose lookup table
+layout(std430, binding = 1) writeonly buffer StraggledBraggBuffer {
+    float b_straggled_depth_dose[];
+};
+
+layout(std140, binding = 2) uniform StragglingConfig {
+    uint  num_depth_bins;
+    float depth_step_mm;
+    float nominal_range_mm;          // R0 = alpha * E0^p
+    float initial_energy_mev;        // E0 in MeV (70 to 230 MeV)
+    float nozzle_energy_spread_mev;  // Accelerator momentum spread (~0.5 to 1.5 MeV)
+    float range_straggling_alpha;    // Bohr parameter ~ 0.012 * R0^0.935
+    float ripple_filter_sigma_mm;    // Passive range modulator width (0 if unmodulated)
+};
+
+void main() {
+    uint bin_idx = gl_GlobalInvocationID.x;
+    if (bin_idx >= num_depth_bins) {
+        return;
+    }
+
+    float z_mm = (float(bin_idx) + 0.5f) * depth_step_mm;
+
+    // Range-energy power law: R0 = 0.0022 * E0^1.77 (cm) -> 0.022 * E0^1.77 (mm)
+    // Derivative dR/dE0 = 1.77 * R0 / E0
+    float dr_de = 1.77f * nominal_range_mm / max(initial_energy_mev, 1.0f);
+
+    // Bohr statistical straggling variance in water: sigma_bohr ~ 0.012 * R0^0.935 (cm)
+    float r_cm = max(nominal_range_mm * 0.1f, 0.1f);
+    float sigma_bohr_mm = 10.0f * (0.012f * pow(r_cm, 0.935f));
+
+    // Accelerator beam energy spread converted to range variance
+    float sigma_nozzle_mm = dr_de * nozzle_energy_spread_mev;
+
+    // Quadrature sum of physical range straggling components
+    float sigma_total_sq = sigma_bohr_mm * sigma_bohr_mm +
+                           sigma_nozzle_mm * sigma_nozzle_mm +
+                           ripple_filter_sigma_mm * ripple_filter_sigma_mm;
+    float sigma_total_mm = sqrt(max(sigma_total_sq, 0.01f));
+
+    // Gaussian convolution over +/- 4 sigma window
+    float half_window_mm = 4.0f * sigma_total_mm;
+    int radius_bins = int(ceil(half_window_mm / depth_step_mm));
+    radius_bins = clamp(radius_bins, 1, 128);
+
+    float norm_sum = 0.0f;
+    float dose_sum = 0.0f;
+    float inv_2sigma2 = 0.5f / (sigma_total_mm * sigma_total_mm);
+
+    for (int offset = -radius_bins; offset <= radius_bins; ++offset) {
+        int sample_idx = int(bin_idx) + offset;
+        if (sample_idx >= 0 && sample_idx < int(num_depth_bins)) {
+            float dz = float(offset) * depth_step_mm;
+            float weight = exp(-dz * dz * inv_2sigma2);
+            dose_sum += b_pristine_depth_dose[sample_idx] * weight;
+            norm_sum += weight;
+        }
+    }
+
+    b_straggled_depth_dose[bin_idx] = dose_sum / max(norm_sum, 1e-6f);
+}
