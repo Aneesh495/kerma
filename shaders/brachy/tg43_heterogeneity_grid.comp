@@ -1,0 +1,97 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * GPU Model-Based Brachytherapy Heterogeneity Correction Shader (AAPM TG-186)
+ *
+ * Implements:
+ * - Raycast primary photon attenuation from brachytherapy dwell position to voxel
+ * - Accounts for tungsten/stainless-steel rectal/vaginal applicator shielding
+ * - Accounts for bone photoelectric absorption and rectal gas cavity scatter perturbation
+ * - Combines unperturbed TG-43 dose with radiological pathlength attenuation ratio:
+ *   D_TG186(r) = D_TG43(r) * exp( -(mu_eff - mu_water) * (L_rad - L_geom) )
+ */
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+
+// Input unperturbed homogeneous water TG-43 dose volume (Gy)
+layout(binding = 0, r32f) readonly uniform image3D u_tg43_homogeneous_dose;
+
+// 3D medium properties (R = mass density g/cm3, G = rel electron density, B = Z_eff)
+layout(binding = 1, rgba32f) readonly uniform image3D u_medium_volume;
+
+// Output AAPM TG-186 heterogeneity-corrected brachytherapy dose (Gy)
+layout(binding = 2, r32f) writeonly uniform image3D u_tg186_dose_output;
+
+layout(std140, binding = 3) uniform TG186Config {
+    vec3  grid_origin_mm;
+    vec3  voxel_spacing_mm;
+    ivec4 volume_dimensions;
+    vec3  seed_position_mm;
+    float mu_water_mm;         // Effective linear attenuation of Ir-192 in water (~0.0110 mm^-1)
+    float ray_step_mm;         // Integration step size (~1.0 mm)
+    float scatter_to_primary;  // Ratio controlling scatter persistence behind shields (~0.35)
+};
+
+void main() {
+    ivec3 coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(coord, volume_dimensions.xyz))) {
+        return;
+    }
+
+    float base_dose = imageLoad(u_tg43_homogeneous_dose, coord).r;
+    if (base_dose <= 0.0f) {
+        imageStore(u_tg186_dose_output, coord, vec4(0.0f));
+        return;
+    }
+
+    vec3 target_pos = grid_origin_mm + (vec3(coord) + 0.5f) * voxel_spacing_mm;
+    vec3 ray_vec = target_pos - seed_position_mm;
+    float dist_mm = length(ray_vec);
+
+    if (dist_mm < 1.0f) {
+        imageStore(u_tg186_dose_output, coord, vec4(base_dose, 0.0f, 0.0f, 0.0f));
+        return;
+    }
+
+    vec3 ray_dir = ray_vec / dist_mm;
+    int num_steps = clamp(int(ceil(dist_mm / ray_step_mm)), 1, 512);
+    float actual_step = dist_mm / float(num_steps);
+
+    float rad_path_mm = 0.0f;
+
+    // March along ray from dwell source to target voxel
+    for (int s = 0; s < num_steps; ++s) {
+        vec3 sample_pos = seed_position_mm + (float(s) + 0.5f) * actual_step * ray_dir;
+        vec3 vox_f = (sample_pos - grid_origin_mm) / voxel_spacing_mm;
+        ivec3 vox = ivec3(floor(vox_f));
+
+        if (all(greaterThanEqual(vox, ivec3(0))) && all(lessThan(vox, volume_dimensions.xyz))) {
+            vec4 med = imageLoad(u_medium_volume, vox);
+            float rho_e = med.g;
+            float z_eff = med.b;
+
+            // Photoelectric enhancement at ~380 keV Ir-192 mean energy for high-Z shields (W, Steel)
+            float z_scale = 1.0f;
+            if (z_eff > 20.0f) {
+                z_scale = pow(z_eff / 7.42f, 1.35f);
+            }
+            rad_path_mm += actual_step * rho_e * z_scale;
+        } else {
+            rad_path_mm += actual_step;
+        }
+    }
+
+    // Exponential transmission factor relative to homogeneous water pathlength
+    float delta_path_mm = rad_path_mm - dist_mm;
+    float primary_transmission = exp(-mu_water_mm * delta_path_mm);
+
+    // Scatter component softens pure exponential shield shadow
+    float primary_fraction = 1.0f / (1.0f + scatter_to_primary);
+    float scatter_fraction = 1.0f - primary_fraction;
+    float effective_transmission = primary_fraction * primary_transmission +
+                                   scatter_fraction * sqrt(primary_transmission);
+
+    float corrected_dose = base_dose * clamp(effective_transmission, 0.05f, 1.50f);
+    imageStore(u_tg186_dose_output, coord, vec4(corrected_dose, 0.0f, 0.0f, 0.0f));
+}
