@@ -1,0 +1,104 @@
+#version 450 core
+
+/**
+ * Kerma Radiation Oncology Simulation Engine
+ * GPU Niemierko Generalized Equivalent Uniform Dose (gEUD) and Biological Objective Shader
+ *
+ * Implements:
+ * - Power-law dose transform D_i^a across masked structure voxels
+ * - Workgroup shared-memory parallel reduction for total structure volume and gEUD accumulator
+ * - Analytical adjoint gradient evaluation d(F_gEUD) / d(D_i) for biological FMO optimization
+ */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Flattened 3D absorbed dose buffer (Gy)
+layout(std430, binding = 0) readonly buffer DoseBuffer {
+    float b_dose_gy[];
+};
+
+// Flattened 3D binary structure mask (1 = inside ROI, 0 = outside)
+layout(std430, binding = 1) readonly buffer StructureMaskBuffer {
+    uint b_roi_mask[];
+};
+
+// Output per-voxel biological adjoint sensitivity gradient d(Cost) / d(D_i)
+layout(std430, binding = 2) writeonly buffer AdjointGradientBuffer {
+    float b_adjoint_gradient[];
+};
+
+// Workgroup partial reductions buffer
+struct PartialReduction {
+    float power_sum;
+    uint  voxel_count;
+};
+
+layout(std430, binding = 3) writeonly buffer PartialSumBuffer {
+    PartialReduction b_partials[];
+};
+
+layout(std140, binding = 4) uniform GEUDConfig {
+    uint  num_total_voxels;
+    float niemierko_param_a;     // a < 0 for target (-10), a > 1 for serial OAR (+12), a ~ 1 for parallel
+    float current_geud_gy;       // Pre-evaluated gEUD from reduction pass
+    float reference_eud_gy;      // Clinical threshold or target EUD (e.g. 60 Gy target or 20 Gy OAR)
+    float penalty_weight;        // Objective weight w
+    uint  total_roi_voxels;      // Pre-counted N_roi
+    uint  is_target_structure;   // 1 = underdose penalty (D < ref), 0 = overdose penalty (D > ref)
+};
+
+shared float s_power_sum[64];
+shared uint  s_count_sum[64];
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint wid = gl_WorkGroupID.x;
+
+    float local_pow = 0.0f;
+    uint  local_cnt = 0u;
+    float grad = 0.0f;
+
+    if (gid < num_total_voxels && b_roi_mask[gid] > 0u) {
+        float d = max(b_dose_gy[gid], 0.05f);
+        // Clamp exponent argument to avoid overflow on extreme serial powers
+        float log_d = log(d);
+        local_pow = exp(clamp(niemierko_param_a * log_d, -40.0f, 40.0f));
+        local_cnt = 1u;
+
+        // Compute biological adjoint gradient if current_geud_gy is populated
+        if (current_geud_gy > 0.0f && total_roi_voxels > 0u) {
+            bool active_violation = (is_target_structure == 1u) ? (current_geud_gy < reference_eud_gy)
+                                                                : (current_geud_gy > reference_eud_gy);
+            if (active_violation) {
+                // d(EUD)/d(D_i) = (1/N) * (EUD)^(1 - a) * (D_i)^(a - 1)
+                float ratio = d / max(current_geud_gy, 0.05f);
+                float deud_ddi = (1.0f / float(total_roi_voxels)) *
+                                 pow(clamp(ratio, 0.01f, 100.0f), niemierko_param_a - 1.0f);
+                float dcost_deud = 2.0f * penalty_weight * (current_geud_gy - reference_eud_gy);
+                grad = dcost_deud * deud_ddi;
+            }
+        }
+        b_adjoint_gradient[gid] = grad;
+    } else if (gid < num_total_voxels) {
+        b_adjoint_gradient[gid] = 0.0f;
+    }
+
+    s_power_sum[lid] = local_pow;
+    s_count_sum[lid] = local_cnt;
+    barrier();
+
+    // Tree reduction across workgroup threads
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            s_power_sum[lid] += s_power_sum[lid + stride];
+            s_count_sum[lid] += s_count_sum[lid + stride];
+        }
+        barrier();
+    }
+
+    if (lid == 0u) {
+        b_partials[wid].power_sum = s_power_sum[0];
+        b_partials[wid].voxel_count = s_count_sum[0];
+    }
+}
