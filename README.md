@@ -27,22 +27,39 @@ The engine implements multiple clinical radiation transport and verification alg
    - Discrete Ordinates (S_N) Linear Boltzmann Transport Equation (LBTE) spatial characteristics sweeper with positive flux fixup.
 
 5. **Advanced Modalities (`shaders/proton/`, `shaders/brachy/`)**
-   - Proton Pencil Beam Scanning (PBS) featuring Bortfeld analytical Bragg peak curves and Fermi-Eyges multiple Coulomb scattering.
-   - High-Dose-Rate (HDR) interstitial brachytherapy using the AAPM TG-43 point and line source formalism.
+   - Proton Pencil Beam Scanning (PBS) featuring Bortfeld analytical Bragg peak curves, Bohr energy straggling, nuclear halo interactions, and Fermi-Eyges multiple Coulomb scattering.
+   - High-Dose-Rate (HDR) interstitial brachytherapy using the AAPM TG-43 point/line-source formalism and AAPM TG-186 heterogeneity attenuation.
 
-6. **4D Deformable Motion (`shaders/deform/`)**
+6. **Monte Carlo Transport and Optimization (`shaders/monte_carlo/`, `shaders/opt/`, `shaders/adaptive/`)**
+   - Woodcock delta-tracking photon transport, relativistic Klein-Nishina Compton scatter, photoelectric/Auger relaxation, Bethe-Heitler pair production, and Class II condensed-history electron stepping.
+   - Inverse Fluence Map Optimization (FMO) via projected gradient descent and L-BFGS quasi-Newton solvers, plus VMAT dynamic arc interpolation.
+   - Online Adaptive Radiotherapy (ART) featuring CBCT scatter correction, synthetic CT fusion, and real-time respiratory gating.
+
+7. **4D Deformable Motion (`shaders/deform/`)**
    - 3D cubic B-spline deformation vector field (DVF) interpolation.
    - Local Jacobian determinant calculation for mass-preserving fractionated dose accumulation.
 
-7. **Quality Assurance and Dosimetric Analysis (`shaders/qa/`, `shaders/dvh/`, `shaders/biology/`)**
-   - Low's 3D Gamma Index evaluation with AAPM TG-218 criteria (3% / 3 mm and 2% / 2 mm).
-   - Parallel reduction differential and cumulative Dose-Volume Histograms (DVH).
-   - Radiobiological modeling: Biologically Effective Dose (BED), EQD2, Lyman-Kutcher-Burman NTCP, and Poisson TCP.
+8. **Quality Assurance and Dosimetric Analysis (`shaders/qa/`, `shaders/dvh/`, `shaders/biology/`)**
+   - Low's 3D Gamma Index evaluation with AAPM TG-218 criteria (3% / 3 mm and 2% / 2 mm), 1D TG-45/142 beam profile QA, and multichannel radiochromic film dosimetry.
+   - Parallel reduction differential/cumulative DVH and Niemierko generalized EUD (gEUD).
+   - Radiobiological modeling: BED, EQD2, Lyman-Kutcher-Burman NTCP, Zaider-Minerbo TCP, and Schneider secondary cancer risk (OED/LAR).
 
-8. **Visualization Shaders (`shaders/render/`)**
-   - Multi-Planar Reconstruction (MPR) cutting planes for axial, coronal, and sagittal views with DICOM window/level adjustment.
-   - Anti-aliased screen-space isodose contour line drawing.
-   - 3D Direct Volume Rendering (DVR) raymarching with semi-transparent dose shells.
+9. **Visualization Shaders (`shaders/render/`)**
+   - Multi-Planar Reconstruction (MPR) cutting planes with DICOM window/level adjustment and anti-aliased isodose contours.
+   - Beam's Eye View (BEV) DRR raycasting with MLC aperture silhouettes and anatomical ROI hatching overlays.
+   - 3D Direct Volume Rendering (DVR) raymarching and 2x2 synchronized clinical workstation HUD composition.
+
+10. **Clinical Protocol Interlocks (`rhai/protocols/`)**
+    - Declarative RTOG-0617 lung SBRT, RTOG-1016 head-and-neck SIB, RTOG-0631 spine SRS, prostate VMAT dual-arc, and Linac interlock specifications.
+
+## Documentation
+
+- [System Architecture](docs/architecture.md)
+- [Physics and Mathematical Models](docs/physics_models.md)
+- [Dosimetry Commissioning Benchmarks](docs/dosimetry_benchmarks.md)
+- [Verification and Regression Report](docs/verification_report.md)
+- [Developer Guide](docs/developer_guide.md)
+- [Clinical Standards Compliance](docs/standards.md)
 
 ## Build and Execution
 
