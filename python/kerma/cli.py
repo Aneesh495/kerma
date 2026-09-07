@@ -15,7 +15,7 @@ def main():
     parser.add_argument("--mu", type=float, default=200.0, help="Monitor units per beam")
     parser.add_argument("--gantry", type=float, default=0.0, help="Gantry angle (degrees)")
     parser.add_argument("--gamma-dta", type=float, default=3.0, help="Gamma DTA criterion (mm)")
-    parser.add_argument("--gamma-dd", type=float, default=3.0, help="Gamma dose difference criterion (%)")
+    parser.add_argument("--gamma-dd", type=float, default=3.0, help="Gamma dose difference criterion (%%)")
 
     args = parser.parse_args()
 
