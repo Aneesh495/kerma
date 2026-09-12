@@ -47,6 +47,9 @@ Every defect discovered during development is captured with a failing test case 
 4. **Bremsstrahlung Spectra Integral Fluence Normalization**:
    - *Symptom*: `test_datasets.py` detected unnormalized weights summing to 1.1893 in `linac_6mv_spectrum.dat` and 0.8108 in `linac_15mv_spectrum.dat`.
    - *Resolution*: Normalized all four energy spectra probability distributions in `data/spectra/` to unit sum (`1.000000`).
+5. **Python CLI Help String Format Escape (Python 3.14 Compatibility)**:
+   - *Symptom*: Invoking `python3 -m kerma.cli` raised `ValueError: unsupported format character ')'` inside `argparse` due to an unescaped `(%)` in `--gamma-dd` help text.
+   - *Resolution*: Added regression tests in `python/tests/test_cli.py` verifying `--help` and full CLI execution, then escaped `(%)` as `(%%)` in `python/kerma/cli.py`.
 
 ## 3. Running the Complete Verification Pipeline
 
